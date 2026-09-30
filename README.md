@@ -1,132 +1,60 @@
 # Bé Bảy (March7) — Twin-Soul AI Assistant for Discord
 
-Bé Bảy là hệ Twin-Soul AI trên Discord: `march7` là agent hội thoại chính, `evernight` là agent độc lập vừa trò chuyện qua DM/tag/prefix vừa làm background consolidation, notification, self-heal. Hai agent giao tiếp qua A2A.
+Bé Bảy là hệ Twin-Soul trên Discord: `march7` chat chính + tool calling, `evernight` chat riêng DM/tag/`!9` + consolidation, notification/approval, self-heal. Hai agent giao tiếp qua A2A ký HMAC.
 
 ## Tính năng chính
 
-- **Discord AI assistant**: hội thoại tự nhiên + tool calling.
-- **Twin-Soul runtime**: `march7` cho chat chính, `evernight` cho chat riêng + tác vụ nền.
-- **Evernight DM/tag/!9**: nhận DM, tag/mention, prefix `!9`; gửi DM thông báo/approval.
-- **Memory 3 tầng**: T1 Redis active, T2 `TimelineSummaryStore` (vector search), T3 Markdown profile.
-- **Background consolidation**: tự động tổng hợp thông qua A2A Consolidation (`March7` gọi `Evernight`).
-- **Self-heal loop**: framework có sẵn, đang phát triển.
+- Discord AI assistant hội thoại + tool calling.
+- Twin-Soul: `march7` (:8000) chat chính, `evernight` (:8001) chat riêng + tác vụ nền.
+- Memory 3 tầng local-first: T1 Redis, T2 vector Harrier, T3 Markdown.
+- Consolidation A2A + self-heal monitor.
+- Host boundary duy nhất: System Gateway native + owner approval.
 
-## Yêu cầu cho agent workflow
-
-Repo này tối ưu cho agent (Claude Code, Antigravity, Cursor, ...). Trước khi để agent đụng vào, cài đặt 2 thứ:
-
-1. **CodeGraph** — index AST của repo, agent dùng cho mọi câu hỏi structural (where is X, what calls Y, impact of Z, ...). Skills đều giả định CodeGraph có sẵn.
-   ```bash
-   npm install -g @colbymchenry/codegraph
-   codegraph init -i      # chạy 1 lần trong repo, tạo .codegraph/
-   ```
-2. **Skills toàn cục** — 6 skill (`implementation-planner`, `thoughtful-coder`, `debug-investigator`, `code-reviewer`, `architecture-docs`, `create-readme`) ở [Flowerf19/agents-skills](https://github.com/Flowerf19/agents-skills). Clone 1 lần, dùng cho mọi project:
-   ```bash
-   git clone https://github.com/Flowerf19/agents-skills.git ~/.claude/skills
-   ```
-   Claude Code auto-discover qua `/<skill-name>`; agent khác point thẳng vào `~/.claude/skills/<name>/SKILL.md`.
-
-Agent docs project-specific (boundary A2A, gotcha runtime, testing) ở [.agents/](.agents/) — bắt đầu đọc từ [.agents/README.md](.agents/README.md).
+Agent workflow (CodeGraph + skills) và boundary: bắt đầu từ [.agents/README.md](.agents/README.md).
 
 ## Kiến trúc tổng quan
 
 ```mermaid
 flowchart LR
-    D[Discord] --> M[March7 bot]
-    D --> E[Evernight bot]
-    M -- "A2A Task (port 8001)<br/>consolidate_discussion" --> E
-    M --> S[(Shared memory stack)]
+    D[Discord] --> M[March7 :8000<br/>python -m gateway]
+    D --> E[Evernight :8001<br/>python -m twin.evernight]
+    M -- "A2A signed<br/>consolidate_discussion" --> E
+    M --> S[(Shared memory T1/T2/T3)]
     E --> S
-    S --> T1[(T1 active memory)]
-    S --> T2[(T2 timeline/vector)]
-    S --> T3[(T3 profile)]
+    M -. "host_system HMAC" .-> G[System Gateway :8380 native]
+    E -. "host_system + gateway_admin" .-> G
 ```
 
-| Agent | Vai trò | Port |
+| Agent | Boot | Vai trò |
 |---|---|---|
-| **March7** | Chat chính, tool calling, T1/T2/T3 shared memory | 8000 |
-| **Evernight** | DM/tag/`!9` chat, notification/approval, self-heal, T1/T2/T3 shared memory | 8001 |
+| March7 | `python -m gateway` | Chat chính, tool loop, A2A :8000 |
+| Evernight | `python -m twin.evernight` | DM/`!9`, approval DM, consolidation, self-heal, A2A :8001 |
 
-Evernight nhận tác vụ xử lý tóm tắt trí nhớ (Consolidation) từ March7 qua A2A (`consolidate_discussion`), truy cập T1 để tóm tắt và ghi xuống T2/T3.
+Discord chỉ là adapter; core agent/memory/tool/approval không phụ thuộc object Discord. Chi tiết: [ARCHITECTURE.md](ARCHITECTURE.md), [.agents/PROJECT_CONTEXT.md](.agents/PROJECT_CONTEXT.md).
 
-### Memory 3 tầng — tại sao & vòng đời
+### Memory 3 tầng
 
-Hai agent chia nhau **một stack memory duy nhất**, tách 3 tầng vì mỗi tầng phục vụ một *latency budget* khác nhau: hot-path phải nhanh, semantic recall chạy async, profile thì biên dịch sẵn. Toàn bộ local-first (LLM + embeddings self-hosted qua LM Studio), không phụ thuộc cloud.
+- **T1 active:** Redis JSON theo scope user/channel, observe/trim nguyên tử Lua, trigger bounded.
+- **T2 timeline:** Redis Stack `VECTOR HNSW DIM=640`, Harrier q4 ONNX duy nhất, recall tool-only qua `search_memory` (`get_context` chỉ T1+T3), gate `T2_MIN_COSINE=0.60`, merge `T2_MERGE_MIN_COSINE=0.75`, merge CAS.
+- **T3 profile:** Markdown 8 section, CAS `expected_profile_hash`, inject system prompt mỗi turn.
+- **Vòng đời A2A:** Evernight `InactivityTrigger` phát hiện idle → March7 ship T1 qua A2A → Evernight `ConsolidateMemoryTool` ghi T2/T3 → March7 trim theo `entry_ids` khi ack fully ok.
 
-- **T1 — active (working memory ngắn hạn):** cửa sổ trượt các message gần nhất theo từng scope (1-1 user hoặc channel) trong Redis. Nạp thẳng vào context mỗi lượt chat. Ngưỡng token kích hoạt consolidation; sau khi tổng hợp, T1 bị cắt bớt nhưng giữ lại phần đuôi gần nhất để giữ mạch hội thoại.
-- **T2 — timeline (semantic memory dài hạn), trên Redis Stack:** Lưu trữ các snapshot tóm tắt quá trình trò chuyện dưới dạng `TimelineSummary` (Redis HASH với vector embedding). Truy hồi ngữ nghĩa qua KNN vector search (`TimelineSummaryStore.search`). Dim index phải khớp `EMBEDDING_VECTOR_SIZE`; đổi dim → drop & tạo lại RediSearch index `timeline_summaries`.
-- **T3 — profile:** một markdown profile các section cố định được cập nhật trực tiếp sau mỗi chu kỳ tóm tắt, sau đó inject vào system prompt mỗi lượt. Profile lưu giữ các fact cốt lõi một cách cô đọng.
+### Host boundary — System Gateway (Plan A, staged, chưa deploy)
 
-**Vòng đời (A2A Consolidation):**
-Hệ thống sử dụng cơ chế A2A trực tiếp thay vì các pipeline tuần tự phức tạp trước đây (Extractor/Curator/Topic):
-1. **Observe:** `March7` nhận tin nhắn và lưu vào `T1 ActiveMemory`.
-2. **Trigger:** `InactivityTrigger` (hiện được quản lý hoàn toàn bởi `Evernight`, đã gỡ khỏi gateway của `March7`) theo dõi tính trạng idle. Khi thỏa điều kiện hoặc T1 đạt ngưỡng, một tác vụ `consolidate_discussion` được sinh ra. Đối với March7, nó dùng `ConsolidationClient` (qua port 8001) gửi yêu cầu sang `Evernight`.
-3. **Consolidate:** `Evernight` nhận yêu cầu (hoặc tự trigger) và chạy `ConsolidateMemoryTool`. Tool này gọi LLM để đọc toàn bộ T1 snapshot, sau đó tạo ra cả bản tóm tắt T2 (`TimelineSummaryStore`) và bản cập nhật T3 (`MarkdownProfileStore`) trong cùng một lượt, rồi lưu trực tiếp vào DB.
-4. **Trim:** T1 được tự động cắt bớt phần cũ để giải phóng context window. Cơ chế chi tiết có thể xem tại `twin/shared/memory/` và qua CodeGraph.
+System Gateway là boundary host DUY NHẤT: native trên host, container gọi qua `SYSTEM_GATEWAY_URL` + HMAC. Foreground mặc định `127.0.0.1:8380`, nhưng bootstrap mặc định `0.0.0.0` khi chưa đặt `SYSTEM_GATEWAY_HOST`: phải cấu hình bind/firewall cho mạng tin cậy trước khi cài. Chưa kiểm chứng firewall thực tế. Không fallback BashExecutor/DockerSocket trực tiếp, không auto-mint.
 
-### Plan trạng thái
-
-- [Memory Rewrite](.agents/plans/memory-rewrite.md) — T1/T2/T3 chạy qua `twin/shared/memory/`, T2 dùng Redis Stack VECTOR HNSW (`EMBEDDING_VECTOR_SIZE`-dim), T3 là Markdown 8 section. **Tiến độ: Phase 11/11 ✓**.
-- Unified Discussion Memory: đã được hấp thụ vào memory rewrite; flow hiện tại dùng hoàn toàn cơ chế **A2A Consolidation** (InactivityTrigger → ConsolidateMemoryTool), thay thế hoàn toàn `SharedMemoryManager → Consolidator → DebouncedScheduler` cũ.
-
-### Gotcha runtime (dễ quên)
-
-- Channel memory chỉ observe channel được phép, không nghe toàn server. Reply trigger gồm cả reply-to-bot.
-- T1 đọc entry mới nhất trước (newest-first). Consolidation tự trigger khi token tích lũy vượt `TOKEN_THRESHOLD=2000` (xem `twin/shared/memory/active/constants.py`).
-- T2 timeline là user-centric: channel scope **extract 1 lần** rồi route mỗi memory về đúng participant nó nói về (`subject_user_id`), **không** fan-out per-author; Redis document dùng `user_id` thật (của subject) làm key trong `TimelineSummaryStore`.
-- Redis Stack RediSearch index phải ở DB 0; dùng `TIMELINE_REDIS_DB=0` cho T2, còn T1 có thể dùng DB riêng theo agent.
-- T3 profile inject vào system prompt mỗi turn qua `MarkdownProfileStore.get_system_prompt_context()`.
-
-### Host boundary — System Gateway
-
-Host interaction giờ đi qua **System Gateway** — native service chạy trực tiếp trên host OS (Linux/macOS/Windows), thay vì qua Docker `nsenter`. Model-facing tool là `host_system` (xem `twin/shared/tools/modules/system/host_system_tool.py`).
-
-Ranh giới code:
-
-- `services/system_gateway/` là native host service package được cài và chạy trên host.
-- `twin/shared/system_gateway/` là protocol/client chung cho HMAC signing, request/response types và `HostGatewayClient`.
-- March7/Evernight gọi host qua `host_system`; riêng Evernight có `gateway_admin` để status/doctor/install/update gateway.
-
-```mermaid
-flowchart LR
-    subgraph C["Container (march7-bot)"]
-        LLM[March7 LLM] --> H["host_system"]:::cur
-        H --> G{"Trạm Gác<br/>ApprovalGate"}
-        G -->|reject| RA["❌ từ chối bởi Trạm Gác"]
-    end
-    G -->|approved<br/>HMAC-signed| N["System Gateway :8380"]:::cur
-    subgraph H["Host"]
-        N -->|policy + audit| X["OS adapter<br/>(Linux/macOS/Windows)"]
-        X --> R["owner-approved shell"]:::cur
-    end
-    classDef cur fill:#e6ffe6,stroke:#1f9d55;
-```
-
-System Gateway cung cấp:
-
-- **HMAC request signing** giữa container ↔ gateway (không còn tin `Origin`).
-- **Nonce + timestamp** chống replay.
-- **Approval id binding** trên mỗi mutating request (server lưu consumed approvals).
-- **Local policy + audit log** ở gateway; raw shell chỉ chạy sau owner approval.
-- **OS adapters** (Linux/macOS/Windows) chạy native trên host, không qua Docker `nsenter`.
-
-Gateway install/update/admin details live in [services/system_gateway/README.md](services/system_gateway/README.md).
-Install guidance phải lấy từ `gateway_admin install` hoặc `gateway_admin install_hint`.
-Repo path thật chỉ được đưa vào install hint khi `SYSTEM_GATEWAY_BOOTSTRAP_REPO_ROOT`
-trỏ tới một repo root mà Evernight có thể verify marker
-`scripts/bootstrap_system_gateway.py` và `services/system_gateway/`. Nếu không
-verify được, hint dùng placeholder `/path/to/march7` để owner tự thay bằng repo
-root trên host.
+- Evernight owner DM/UI là trusted issuer duy nhất; March7 chỉ request + consume grant, không sign. Chỉ configured owner (`EVERNIGHT_OWNER_USER_ID`) approve; non-owner được request, không bao giờ approve. Missing owner/key fails closed (deny, không fallback).
+- Request-HMAC key `SYSTEM_GATEWAY_SHARED_SECRET` KHÁC private approval key FILE. Approval value chỉ ở host-private FILE ngoài repo, mount read-only vào Evernight duy nhất (`/run/secrets/system_gateway_approval`); secrets không nằm trong shared `.env`/repo. Equal credentials bị reject.
+- Grant là owner-signed structured token (`canonical_approval_action` + `mint/verify_approval_token`) bound canonical execution + actor + expiry + durable single use (SQLite ledger + nonce). Bare approval ID không đủ.
+- Native generic shell là path duy nhất; raw shell denied by default (`SYSTEM_GATEWAY_RAW_SHELL=false`) và vẫn cần grant khi bật.
+- Source `twin/`+`gateway/`+`models/` `:ro`; chỉ OWN persona overlay writable; `memories/`+`data/` writable; owner-absent boot deny không crash.
+- Install/update do owner chạy thủ công (`gateway_admin install` → `scripts/bootstrap_system_gateway.py`); agent không tự cài từ Docker. Chi tiết: [services/system_gateway/README.md](services/system_gateway/README.md).
 
 ## Prerequisites
 
-- Python `3.11+`
-- Docker + Docker Compose v2
-- Discord bot token(s) + API key LLM provider
+- Python `3.11+`, Docker + Compose v2, Discord bot token(s) + LLM endpoint/key.
 
 ## Quick start
-
-**Docker (khuyến nghị):**
 
 ```bash
 cd docker
@@ -136,66 +64,37 @@ docker compose up -d
 docker compose logs -f
 ```
 
-**Local Python:**
+Local: `pip install -r requirements.txt`, rồi `python -m gateway` (March7) hoặc `python -m twin.evernight` (Evernight). Health: `:8000/health`, `:8001/health` (503 khi Discord chưa connected); A2A card: cùng port `/.well-known/agent.json`. Chi tiết: [docker/README.md](docker/README.md).
 
-```bash
-pip install -r requirements.txt
-python -m gateway
-# hoặc:
-python -m twin.march7
-python -m twin.evernight
-```
-
-> [!TIP]
-> Health: `http://localhost:8000/health`, `http://localhost:8001/health` (503 khi bot Discord
-> chưa connected). Agent card A2A: cùng port, `/.well-known/agent.json`.
+> [!IMPORTANT]
+> Entrypoint gọi `load_dotenv(override=True)` nếu tìm thấy file `.env`. Compose chỉ inject `env_file` và explicit peer-credential blank overrides, **không bind/copy `.env` vào container**: file đó có thể đè các blank overrides, phá isolation. Sau khi owner đổi cấu hình, recreate: `docker compose -f docker/docker-compose.yml up -d --force-recreate march7 evernight`.
+>
+> A2A streaming bắt buộc một `event: complete` với `message_count` khớp số message đã nhận, EOF sạch và final status `COMPLETED`; status riêng không chứng minh đã nhận hết output. **Nâng cấp March7 và Evernight cùng nhau**; client mới từ chối stream server cũ không có marker, không có legacy fallback. Chưa deploy.
 
 ## Cấu hình
 
-Nhóm env vars chính (chi tiết ở [.agents/PROJECT_CONTEXT.md](.agents/PROJECT_CONTEXT.md)):
+Nhóm chính (không in giá trị thật): shared (`REDIS_URL`, `TIMELINE_REDIS_DB`, `CODEBOX_API_URL`, `SYSTEM_GATEWAY_URL`), March7/Evernight ports + DB + persona, Discord tokens, T1 budget, Harrier/T2 gates, LLM provider. Chi tiết: [.agents/PROJECT_CONTEXT.md](.agents/PROJECT_CONTEXT.md), [docker/README.md](docker/README.md), LLM/embeddings: [twin/shared/llm/README.md](twin/shared/llm/README.md).
 
-- Shared: `REDIS_URL`, `TIMELINE_REDIS_DB`, `CODEBOX_API_URL`, `SYSTEM_GATEWAY_URL`
-- March7: `MARCH7_A2A_PORT`, `MARCH7_REDIS_DB`, `MARCH7_PERSONA_PATH`
-- Evernight: `EVERNIGHT_A2A_PORT`, `EVERNIGHT_REDIS_DB`, `POLL_INTERVAL`, `SELF_HEAL_ENABLED`
-- Discord/Gateway: `DISCORD_MARCH7_TOKEN`, `DISCORD_EVERNIGHT_TOKEN`, `GATEWAY_ENABLED_PLATFORMS`
-- T1 budget: `T1_CONTEXT_MAX_TOKENS`, `T1_CONTEXT_MAX_MESSAGES`
-- Embeddings/T2: `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL_NAME`, `EMBEDDING_VECTOR_SIZE`, `EMBEDDING_API_URL`, `EMBEDDING_API_KEY`
-- LLM: `LLM_PROVIDER`, `OPENAI_API_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` (OpenAI-compat; đặt URL/key theo provider)
+## Migration T2 (xác nhận bắt buộc, không rút gọn)
 
-> [!NOTE]
-> Docker dùng `redis/redis-stack-server` — cùng service phục vụ cả T1 và T2.
-
-> [!IMPORTANT]
-> Mọi entrypoint gọi `load_dotenv(override=True)` — file `.env` LUÔN đè block `environment:` trong docker-compose. **`.env` là nguồn sự thật.** Sau khi đổi `.env`, recreate container (không cần rebuild image):
-> ```bash
-> docker compose -f docker/docker-compose.yml up -d --force-recreate march7 evernight
-> ```
-
-LLM + embeddings (OpenAI-compat / Gemini native qua factory): xem [twin/shared/llm/README.md](twin/shared/llm/README.md).
+Đổi dim KHÔNG dùng `FT.DROPINDEX`/restart thô. Dùng `python3 scripts/migrate_t2_harrier.py ...` (dry-run mặc định khi không có `--apply`/`--rollback`; parser không có flag `--dry-run`) rồi `--apply --backup PATH` (backup full HASH + SHA-256, verify trước mọi write, resumable, chỉ rewrite `embedding` từ `summary`; `--recreate-index` chỉ sau validation, `DROPINDEX` không `DD`; `--rollback --backup PATH`). KHÔNG bao giờ `DEL`/`UNLINK`/`FLUSHALL`/`DD`, KHÔNG pad/truncate vector 1024 cũ. Field additive (`day`/`period_start`/`period_end`) dùng `FT.ALTER`, không reindex. Production migration là owner action thủ công; backup trước khi migrate explicit; không xóa dữ liệu thật.
 
 ## Development & testing
 
 ```bash
 pytest tests/unit/ -v
 pytest tests/integration/ -v
-pytest tests/e2e/ -v
 ```
+
+Chọn test focused và service deps theo [.agents/TESTING_GUIDE.md](.agents/TESTING_GUIDE.md). Không chạy Discord/host-exec/network thật để verify docs.
 
 ## Troubleshooting
 
-> [!WARNING]
-> Bash Executor là tool đặc quyền. Bật khi cần và giữ luồng approve theo [scripts/README.md](scripts/README.md).
-
-- Trạng thái containers: `docker compose -f docker/docker-compose.yml ps`
-- Logs: `docker compose -f docker/docker-compose.yml logs -f march7 evernight`
-- A2A health: port `8000` và `8001`
-- **LM Studio**: phải bind `0.0.0.0` (`lms server start --host 0.0.0.0`) để container gọi được qua `host.docker.internal:1234`.
-- **Đổi embedding dim**: sau khi đổi `EMBEDDING_VECTOR_SIZE`, drop và tạo lại RediSearch index `timeline_summaries` (T2 data cũ không tương thích).
+- Containers/logs: `docker compose -f docker/docker-compose.yml ps|logs -f march7 evernight`.
+- LM Studio phải bind `0.0.0.0` để container gọi qua `host.docker.internal:1234`.
+- Đổi embedding dim: chỉ dùng staged migration ở trên.
 
 ## Tài liệu liên quan
 
-- [.agents/](.agents/) — agent guidance (start: [README.md](.agents/README.md))
-- [services/system_gateway/README.md](services/system_gateway/README.md) — native host gateway architecture, install, security, and runbook
-- [twin/shared/llm/README.md](twin/shared/llm/README.md) — LLM + embedding config
-- [scripts/README.md](scripts/README.md) — bash executor security
-- [docker/README.md](docker/README.md) — Docker runbook
+- [.agents/](.agents/) (start: [README.md](.agents/README.md)), [ARCHITECTURE.md](ARCHITECTURE.md)
+- [services/system_gateway/README.md](services/system_gateway/README.md), [docker/README.md](docker/README.md), [twin/shared/llm/README.md](twin/shared/llm/README.md), [scripts/README.md](scripts/README.md)

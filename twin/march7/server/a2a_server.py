@@ -3,6 +3,7 @@ import asyncio
 import logging
 from typing import AsyncIterator
 
+from twin.shared.a2a.auth import skill_peers_for_agent
 from twin.shared.a2a.server import A2AServer
 from twin.shared.a2a.types import A2AMessage, Part, AgentCard
 from twin.march7.agent import March7Agent
@@ -61,11 +62,28 @@ class March7A2AHandler:
         )
 
 
+def validate_march7_session(skill: str, session_id: object) -> str | None:
+    """Validate the session scope for a March7 skill.
+
+    Returns an error message when invalid, else None. Memory skills only ever
+    address one Discord user id; anything else-shaped is rejected instead of
+    being trusted as a lookup key.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        return f"invalid sessionId for skill '{skill}': session is required"
+    if skill in {"get_snapshot", "clear_session"} and not session_id.isdigit():
+        return f"invalid sessionId for skill '{skill}': user id must be numeric"
+    return None
+
+
 def start_server(
     agent: March7Agent,
     host="0.0.0.0",
     port=8000,
     health_probe=None,
+    *,
+    shared_secret: str | None = None,
+    skill_peers: dict[str, frozenset] | None = None,
 ) -> A2AServer:
     handler = March7A2AHandler(agent)
     server = A2AServer(
@@ -78,5 +96,9 @@ def start_server(
         host=host,
         port=port,
         health_probe=health_probe,
+        agent_name="march7",
+        shared_secret=shared_secret,
+        skill_peers=skill_peers if skill_peers is not None else skill_peers_for_agent("march7"),
+        session_validator=validate_march7_session,
     )
     return server

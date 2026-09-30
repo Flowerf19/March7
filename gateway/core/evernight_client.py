@@ -14,9 +14,18 @@ logger = logging.getLogger(__name__)
 class EvernightClient:
     """A2A HTTP client that communicates with the Evernight agent."""
 
-    def __init__(self, base_url: str = "http://evernight:8001", timeout: float = 120.0):
+    def __init__(
+        self,
+        base_url: str = "http://evernight:8001",
+        timeout: float = 120.0,
+        *,
+        actor: str = "march7",
+        secret: str | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
-        self._client = A2AClient(base_url=self.base_url, timeout=timeout)
+        self._client = A2AClient(
+            base_url=self.base_url, timeout=timeout, actor=actor, secret=secret
+        )
 
     @traceable(name="a2a.evernight_chat", run_type="chain", tags=["a2a", "evernight", "chat"])
     async def send_chat(self, user_id: str, content: str) -> str:

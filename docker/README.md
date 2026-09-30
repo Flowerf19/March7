@@ -15,24 +15,21 @@ Docker Compose là runtime chính cho kiến trúc Twin-Soul của dự án:
 ```
 docker/
 ├── docker-compose.yml           # Master compose (network + includes)
-│
 ├── shared/
 │   ├── Dockerfile.base
 │   ├── docker-compose.base.yml
-│   ├── docker-compose.redis.yml
+│   ├── docker-compose.redis.yml      # redis_data là NAMED volume (không phải bind ./volumes)
 │   └── docker-compose.codebox.yml
 ├── march7/
 │   ├── Dockerfile
-│   └── docker-compose.yml
+│   └── docker-compose.yml       # source :ro + own persona overlay writable
 ├── evernight/
 │   ├── Dockerfile
-│   └── docker-compose.yml
-│
-├── README.md                    # This file
-│
-└── volumes/                     # Persistent data (bind mounts)
-    └── redis_data/              # Redis AOF/RDB — T1 + coordination
+│   └── docker-compose.yml       # source :ro + own persona overlay + approval-key mount (Evernight only)
+└── README.md                    # This file
 ```
+
+Agent mounts (xem 2 compose files): `twin/` + `gateway/` read-only (`:ro,z`); overlay writable chỉ cho OWN persona dir (`twin/<agent>/personas`, data-only `.md`, peer path vẫn read-only qua parent mount); `models/` read-only (`/app/models:ro`, host pull bằng `scripts/pull_harrier_model.py`); `memories/` + `data/` writable.
 
 ## Architecture
 
@@ -99,11 +96,13 @@ DOCKER_BUILDKIT=1 docker compose -f docker/docker-compose.yml build march7
 
 ## Data Persistence
 
-Tất cả dữ liệu lưu trong `docker/volumes/` qua bind mounts:
-
-| Directory | Purpose | Storage |
+| Mount | Purpose | Storage |
 |-----------|---------|---------|
-| `redis_data/` | T1 + coordination | Redis AOF/RDB |
+| named volume `redis_data` (`/data`) | T1 + T2 + coordination | Redis AOF/RDB (Redis Stack `7.2.0-v18`) |
+| bind `twin/`, `gateway/` `:ro` | runtime source (read-only) | host repo |
+| bind own `twin/<agent>/personas` writable | persona `.md` data-only | host repo |
+| bind `memories/`, `data/` writable | T3 Markdown + app data | host repo |
+| bind `models/` `:ro` | Harrier q4 ONNX (host-pulled) | host repo |
 
 ## Commands Reference
 
@@ -146,13 +145,14 @@ Chỉ rebuild image khi:
 
 ## Environment Variables
 
-Bot service đọc từ `../.env`. Key variables:
+Bot services dùng chung `env_file: ../../.env` (common config), KHÔNG bind `.env` file vào container. Peer credential isolation bằng explicit blank override (compose precedence `environment:` > `env_file`): march7 set `DISCORD_EVERNIGHT_TOKEN=` trống, evernight set `DISCORD_MARCH7_TOKEN=` trống; march7 còn blank `SYSTEM_GATEWAY_APPROVAL_SECRET=` và `SYSTEM_GATEWAY_APPROVAL_SECRET_FILE=` để stray `.env` entry không reintroduce được. Key variables (không in giá trị thật, không commit secret vào repo):
 
 ```env
-# Discord
-DISCORD_MARCH7_TOKEN=your_march7_bot_token
-DISCORD_MARCH7_CLIENT_ID=your_march7_client_id
-DISCORD_EVERNIGHT_TOKEN=your_evernight_bot_token
+# Discord (mỗi agent chỉ thấy token của mình; peer token bị blank trong compose)
+DISCORD_MARCH7_TOKEN=<march7-bot-token>
+DISCORD_MARCH7_CLIENT_ID=<march7-client-id>
+DISCORD_EVERNIGHT_TOKEN=<evernight-bot-token>
+EVERNIGHT_OWNER_USER_ID=<configured-owner-platform-id>
 
 # Gateway
 GATEWAY_ENABLED_PLATFORMS=discord
@@ -162,20 +162,26 @@ DISCORD_GATEWAY_ENABLED=true
 LLM_PROVIDER=openai
 OPENAI_API_URL=http://host.docker.internal:11434/v1
 OPENAI_API_KEY=dummy-key
-OPENAI_MODEL=your-model
+OPENAI_MODEL=<model-name>
 
-# Embeddings
-EMBEDDING_PROVIDER=openai
-EMBEDDING_API_URL=http://host.docker.internal:11434/v1
-EMBEDDING_API_KEY=dummy-key
-EMBEDDING_MODEL_NAME=your-embedding-model
-EMBEDDING_VECTOR_SIZE=1024
+# Embeddings (local Harrier q4 ONNX only, dim 640)
+HARRIER_MODEL_DIR=models/harrier-q4
+EMBEDDING_VECTOR_SIZE=640
+T2_MIN_COSINE=0.60
+T2_MERGE_MIN_COSINE=0.75
 
 # Infrastructure (internal Docker network)
 REDIS_URL=redis://redis:6379
 TIMELINE_REDIS_DB=0
 CODEBOX_API_URL=http://codebox:8069
+
+# Native System Gateway (Plan A trust)
+SYSTEM_GATEWAY_URL=http://host.docker.internal:8380
+SYSTEM_GATEWAY_SHARED_SECRET=<request-hmac-key>
+SYSTEM_GATEWAY_RAW_SHELL=false
 ```
+
+Plan A secrets (confirm đầy đủ, không rút gọn): request-HMAC key `SYSTEM_GATEWAY_SHARED_SECRET` KHÁC private approval key; approval key value KHÔNG BAO GIỜ nằm trong env/shared `.env`/repo, chỉ nằm ở host-private FILE ngoài repo và mount read-only vào Evernight duy nhất (`target: /run/secrets/system_gateway_approval`, `read_only: true`, `bind.create_host_path: false`, `selinux: z`; `docker/evernight/docker-compose.yml`). Host source override (nonsecret path): `${SYSTEM_GATEWAY_APPROVAL_SECRET_HOST_PATH:-${HOME}/.config/system-gateway/approval_secret}` (user default `~/.config/system-gateway/approval_secret`; root native CLI/service align `/etc/system-gateway/approval_secret` qua cùng resolver + explicit override). Trong container Evernight: `SYSTEM_GATEWAY_APPROVAL_SECRET_FILE=/run/secrets/system_gateway_approval`. March7 KHÔNG mount key, KHÔNG đọc key, chỉ request + consume grant, không bao giờ sign approval. Missing owner (`EVERNIGHT_OWNER_USER_ID` trống) hoặc missing key fails closed (deny, không fallback sang request secret). Raw shell denied by default (`SYSTEM_GATEWAY_RAW_SHELL=false`), native generic shell là path duy nhất, mọi shell cần owner-signed grant. Chưa có deployment nào xảy ra; sau khi đổi `.env`, owner recreate thủ công (`docker compose -f docker/docker-compose.yml up -d --force-recreate march7 evernight`), không cần rebuild image trừ khi đổi deps/Dockerfile.
 
 ## Redis Stack Notes
 

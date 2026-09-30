@@ -1,20 +1,17 @@
-"""Embedding services package.
+"""Embedding services package (local Harrier ONNX only, no API).
 
 Public API:
-    create_embedding_service()  — factory, routes by EMBEDDING_PROVIDER
-    BaseEmbeddingService        — ABC for custom providers
-    OpenAIEmbeddingService      — OpenAI-compatible (covers Qwen, Voyage, ...)
-    GeminiEmbeddingService      — native Gemini :embedContent
+    create_embedding_service()  — factory, builds HarrierEmbeddingService
+    BaseEmbeddingService        — ABC (cache, dim-fit, trace)
+    HarrierEmbeddingService     — local Harrier q4 ONNX embeddings
 """
 
 from .base_embedding_service import BaseEmbeddingService
 from .embedding_factory import create_embedding_service
-from .gemini_embedding_service import GeminiEmbeddingService
-from .openai_embedding_service import OpenAIEmbeddingService
+from .harrier_embedding_service import HarrierEmbeddingService
 
 __all__ = [
     "BaseEmbeddingService",
-    "OpenAIEmbeddingService",
-    "GeminiEmbeddingService",
+    "HarrierEmbeddingService",
     "create_embedding_service",
 ]

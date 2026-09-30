@@ -10,7 +10,6 @@ from twin.shared.system_gateway import (
     HostGatewayClient,
     HostGatewayError,
     HostGatewayUnavailableError,
-    mint_approval_token,
 )
 from twin.shared.tools.approval_gate import ApprovalGate
 from twin.shared.tools.registry.base import BaseTool, ToolExecutionError
@@ -127,17 +126,25 @@ class HostSystemTool(BaseTool):
             return "❌ Shell execution đang bị tắt trên System Gateway (raw_shell=false)."
 
         clean_command = command.strip()
-        approval_text = f"host shell: {clean_command}"
-        approved = await self.approval_gate.check_approval(self.name, approval_text)
-        if not approved:
-            return "❌ Lệnh host_system bị từ chối bởi Trạm Gác."
+        actor = getattr(self.host_gateway_client, "actor", "march7") or "march7"
+        if hasattr(self.host_gateway_client, "shared_secret") and not self.host_gateway_client.shared_secret:
+            return "❌ System Gateway shared secret chưa được cấu hình (request-signing credential missing)."
+        # March7 never mints: the grant below is issued by owner-trusted
+        # Evernight (holder of the separate approval key) only after an
+        # actual owner approval, bound to this exact execution + actor.
+        decision = await self.approval_gate.authorize_host(
+            action="shell",
+            command=clean_command,
+            shell=shell,
+            cwd=cwd,
+            timeout=timeout,
+            actor=actor,
+        )
+        if not decision.approved or not decision.grant:
+            reason = decision.reason or "bị từ chối"
+            return f"❌ Lệnh host_system bị từ chối bởi Trạm Gác ({reason})."
 
-        approval_id = self._mint_token("shell")
-        if approval_id is None:
-            return (
-                "❌ System Gateway thiếu shared secret nên không thể cấp phép lệnh. "
-                "Cấu hình SYSTEM_GATEWAY_SHARED_SECRET trước."
-            )
+        approval_id = decision.grant
 
         response = await self.host_gateway_client.run_shell(
             GatewayShellRequest(
@@ -149,19 +156,6 @@ class HostSystemTool(BaseTool):
             )
         )
         return self._format_response(clean_command, response.ok, response.output, response.error)
-
-    def _mint_token(self, action: str) -> str | None:
-        """Mint an action-bound, single-use approval token after approval.
-
-        The token binds to the same canonical action string the server checks
-        and to the client's actor. Returns None if no shared secret is set.
-        """
-
-        secret = getattr(self.host_gateway_client, "shared_secret", None)
-        if not secret:
-            return None
-        actor = getattr(self.host_gateway_client, "actor", "march7")
-        return mint_approval_token(secret=secret, action=action, actor=actor)
 
     def _render_needs_install(self) -> str:
         from twin.evernight.host_gateway.installer import build_bootstrap_hint

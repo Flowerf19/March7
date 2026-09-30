@@ -516,3 +516,87 @@ async def test_get_profile_tool_reads_raw_and_section():
     assert "## Thông tin cơ bản" in raw
     assert "- Phim tâm lý" in section
     assert "- Cờ vua" in section
+
+
+# ------------------------------------------------- #32 global top-K ranking
+
+
+@pytest.mark.asyncio
+async def test_search_memory_tool_global_ranking_channel_outranks_user():
+    """Dual-scope semantic recall is globally ranked by relevance (#32):
+    a stronger channel hit (score 0.1 -> sim 0.9) outranks a weaker user
+    hit (score 0.5 -> sim 0.5) instead of user-first truncation."""
+    store = FakeTimelineSearch(results_by_user={
+        "12345": [
+            {
+                "summary_id": "weak-user",
+                "user_id": "12345",
+                "summary": "Chuyện user mờ nhạt.",
+                "score": 0.5,
+                "created_at": 1718360000.0,
+            },
+        ],
+        "99999": [
+            {
+                "summary_id": "strong-chan",
+                "user_id": "99999",
+                "summary": "Chuyện kênh rất khớp.",
+                "score": 0.1,
+                "created_at": 1718361000.0,
+            },
+        ],
+    })
+    embeddings = FakeEmbeddingService()
+    tool = SearchMemoryTool(timeline_summary_store=store, embedding_service=embeddings)
+
+    result = await tool.execute(user_id="12345", channel_id="99999", query="khớp")
+
+    assert "Tìm thấy 2 ký ức" in result
+    assert result.index("summary_id=strong-chan") < result.index("summary_id=weak-user")
+
+
+@pytest.mark.asyncio
+async def test_search_memory_tool_global_ranking_respects_limit():
+    """limit=1 across two scopes returns the single globally-best hit."""
+    store = FakeTimelineSearch(results_by_user={
+        "12345": [
+            {"summary_id": "weak-user", "summary": "Mờ.", "score": 0.5,
+             "created_at": 1718360000.0},
+        ],
+        "99999": [
+            {"summary_id": "strong-chan", "summary": "Khớp.", "score": 0.1,
+             "created_at": 1718361000.0},
+        ],
+    })
+    embeddings = FakeEmbeddingService()
+    tool = SearchMemoryTool(timeline_summary_store=store, embedding_service=embeddings)
+
+    result = await tool.execute(
+        user_id="12345", channel_id="99999", query="khớp", limit=1,
+    )
+
+    assert "Tìm thấy 1 ký ức" in result
+    assert "strong-chan" in result
+    assert "weak-user" not in result
+
+
+@pytest.mark.asyncio
+async def test_search_memory_tool_recent_sorts_updated_old_first():
+    """Recent branch uses content time (#33): an old-created summary with a
+    fresh period_end (merged today) outranks a newer-created legacy doc."""
+    store = FakeTimelineSearch(recent_by_user={
+        "12345": [
+            {"summary_id": "legacy", "summary": "Tạo sau, không period.",
+             "created_at": 1718400000.0},
+        ],
+        "99999": [
+            {"summary_id": "updated", "summary": "Tạo trước, vừa merge.",
+             "created_at": 1718300000.0, "period_end": 1718500000.0},
+        ],
+    })
+    embeddings = FakeEmbeddingService()
+    tool = SearchMemoryTool(timeline_summary_store=store, embedding_service=embeddings)
+
+    result = await tool.execute(user_id="12345", channel_id="99999")
+
+    assert result.index("summary_id=updated") < result.index("summary_id=legacy")

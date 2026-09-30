@@ -118,6 +118,8 @@ class ManageUserProfileTool(BaseTool):
                 return None, f"Lỗi: {label} #{idx} không được trống."
             if "\n" in value or "\r" in value:
                 return None, f"Lỗi: {label} #{idx} phải nằm trên một dòng."
+            if any((ord(c) < 0x20 and c != "\t") or ord(c) == 0x7F for c in value):
+                return None, f"Lỗi: {label} #{idx} chứa ký tự điều khiển."
             if value.startswith("- "):
                 return None, f"Lỗi: {label} #{idx} không được có prefix '- '."
             cleaned.append(value)

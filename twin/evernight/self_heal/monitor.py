@@ -3,15 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from abc import ABC, abstractmethod
 
 import aiohttp
 
-logger = logging.getLogger(__name__)
+from twin.evernight.host_gateway.monitor import RESTART_ALLOWED_CONTAINERS
 
-# Default user ID for self-heal notifications
-DEFAULT_NOTIFY_USER_ID = 726302130318868500
+logger = logging.getLogger(__name__)
 
 
 class RecoveryExecutor(ABC):
@@ -20,59 +18,80 @@ class RecoveryExecutor(ABC):
         """Restart a container and return (success, detail)."""
 
 
-class GatewayRecoveryExecutor(RecoveryExecutor):
-    """Restart containers via the System Gateway policy-gated restart path.
+class DenyRecoveryExecutor(RecoveryExecutor):
+    """Fail-closed default when no authorized recovery path is configured."""
 
-    Preferred over DockerCommandRecoveryExecutor when SYSTEM_GATEWAY_URL is
-    configured.
+    def __init__(self, reason: str = "recovery unavailable"):
+        self._reason = reason
+
+    async def restart_container(self, container_name: str) -> tuple[bool, str]:
+        return False, self._reason
+
+
+def _resolve_dm_backend(discord_adapter: object):
+    """Build a Discord DM backend from the adapter's bot, if it is ready."""
+    bot = getattr(discord_adapter, "bot", None)
+    if bot is None:
+        return None
+    try:
+        if not bot.is_ready():
+            return None
+    except Exception:
+        return None
+    from gateway.adapters.discord.dm_delivery import DiscordDMDelivery
+
+    return DiscordDMDelivery(bot)
+
+
+class OwnerApprovalRecoveryExecutor(RecoveryExecutor):
+    """Restart containers only after a real owner approval.
+
+    The recovery shell (`docker restart <name>`) goes through the same
+    owner DM approval + issuer grant as any other host command, then through
+    the native gateway. No owner, no approval, or no DM path means no
+    restart. There is no direct Docker/subprocess side channel.
     """
 
-    def __init__(self, gateway_monitor):
+    def __init__(
+        self,
+        *,
+        gateway_monitor,
+        owner_user_id: int | str | None = None,
+        dm_backend=None,
+        discord_adapter=None,
+        dm_timeout: float = 60.0,
+    ):
         self.gateway_monitor = gateway_monitor
+        self._owner_user_id = owner_user_id
+        self._dm_backend = dm_backend
+        self._discord_adapter = discord_adapter
+        self._dm_timeout = dm_timeout
 
     async def restart_container(self, container_name: str) -> tuple[bool, str]:
+        from twin.evernight.server.approval_issuer import approve_local_shell
+
         if self.gateway_monitor is None:
             return False, "GatewayMonitor not available"
+        if container_name not in RESTART_ALLOWED_CONTAINERS:
+            return False, f"container {container_name!r} not in allowed list"
 
-        # Mint an approval token for container.restart
-        approval_id = None
-        client = getattr(self.gateway_monitor, "_client", None)
-        if client is not None:
-            secret = getattr(client, "shared_secret", None)
-            if secret:
-                from twin.shared.system_gateway import mint_approval_token
-
-                actor = getattr(client, "actor", "evernight")
-                approval_id = mint_approval_token(
-                    secret=secret, action="container.restart", actor=actor
-                )
-
-        return await self.gateway_monitor.request_container_restart(
-            container_name, approval_id=approval_id
+        backend = self._dm_backend or _resolve_dm_backend(self._discord_adapter)
+        command = f"docker restart {container_name}"
+        # Bind the exact timeout the monitor will send to the gateway.
+        timeout = getattr(self.gateway_monitor, "timeout", 10)
+        decision = await approve_local_shell(
+            backend=backend,
+            owner_user_id=self._owner_user_id,
+            command=command,
+            timeout=timeout,
+            channel_name="self-heal",
+            dm_timeout=self._dm_timeout,
         )
-
-
-class DockerCommandRecoveryExecutor(RecoveryExecutor):
-    async def restart_container(self, container_name: str) -> tuple[bool, str]:
-        try:
-            process = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    "docker", "restart", container_name,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                ),
-                timeout=30,
-            )
-            stdout, stderr = await process.communicate()
-            if process.returncode == 0:
-                return True, stdout.decode().strip()
-            return False, stderr.decode().strip()
-        except asyncio.TimeoutError:
-            return False, "docker restart timed out"
-        except FileNotFoundError:
-            return False, "docker command not found"
-        except Exception as e:
-            return False, str(e)
+        if not decision.approved or not decision.grant:
+            return False, f"restart denied: {decision.reason}"
+        return await self.gateway_monitor.request_container_restart(
+            container_name, approval_id=decision.grant
+        )
 
 
 class SelfHealMonitor:
@@ -86,7 +105,7 @@ class SelfHealMonitor:
         failure_threshold: int = 3,
         container_name: str = "march7",
         discord_adapter=None,
-        notify_user_id: int = DEFAULT_NOTIFY_USER_ID,
+        notify_user_id: int | str | None = None,
         recovery_executor: RecoveryExecutor | None = None,
         gateway_monitor=None,
     ):
@@ -99,15 +118,18 @@ class SelfHealMonitor:
         self._notify_user_id = notify_user_id
         self._gateway_monitor = gateway_monitor
 
-        # Prefer GatewayRecoveryExecutor when SYSTEM_GATEWAY_URL is set
         if recovery_executor is not None:
             self._recovery_executor = recovery_executor
-        elif gateway_monitor is not None or os.getenv("SYSTEM_GATEWAY_URL"):
-            self._recovery_executor = GatewayRecoveryExecutor(
-                gateway_monitor=gateway_monitor
+        elif gateway_monitor is not None:
+            self._recovery_executor = OwnerApprovalRecoveryExecutor(
+                gateway_monitor=gateway_monitor,
+                owner_user_id=notify_user_id,
+                discord_adapter=discord_adapter,
             )
         else:
-            self._recovery_executor = DockerCommandRecoveryExecutor()
+            self._recovery_executor = DenyRecoveryExecutor(
+                "GatewayMonitor not available"
+            )
 
         self._failure_count = 0
         self._running = False
@@ -154,18 +176,22 @@ class SelfHealMonitor:
             await asyncio.sleep(self.interval)
 
     async def _check_health(self) -> bool:
-        """Check March7 health via A2A agent card endpoint."""
+        """Check March7 health via its /health endpoint.
+
+        The agent card answers 200 whenever the A2A server is up, even with
+        Discord disconnected, so it must never be used as a health signal.
+        """
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(f"{self.march7_url}/.well-known/agent.json") as resp:
+                async with session.get(f"{self.march7_url}/health") as resp:
                     return resp.status == 200
         except Exception:
             logger.debug("March7 health check unreachable at %s", self.march7_url)
             return False
 
     async def _restart_march7(self):
-        """Restart the March7 container via docker command."""
+        """Restart the March7 container through the authorized recovery path."""
         logger.warning("Restarting March7 container: %s", self.container_name)
         success, detail = await self._recovery_executor.restart_container(self.container_name)
         if success:
@@ -176,7 +202,7 @@ class SelfHealMonitor:
 
     async def _notify_restart(self):
         """Notify users about the restart via Discord DM."""
-        if self._discord_adapter is None:
+        if self._discord_adapter is None or self._notify_user_id is None:
             logger.info("March7 container restarted (no Discord adapter for notification)")
             return
 

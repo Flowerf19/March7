@@ -11,7 +11,7 @@ services:
     networks:
       - march7_net
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     command: ["python", "-m", "gateway"]
     depends_on:
       redis:
@@ -43,14 +43,27 @@ services:
 
       # Peer agent endpoint
       - EVERNIGHT_A2A_URL=http://evernight:8001
+
+      # Peer credential isolation: env_file provides shared config, but the
+      # other agent's bot token must never reach this process. Explicit empty
+      # overrides win over env_file (compose precedence: environment > env_file).
+      - DISCORD_EVERNIGHT_TOKEN=
+      # Owner approval key must never reach March7 (Evernight-only mount).
+      # Blank both the inline value (unsupported, forbidden) and the file path
+      # so a stray .env entry cannot reintroduce them.
+      - SYSTEM_GATEWAY_APPROVAL_SECRET=
+      - SYSTEM_GATEWAY_APPROVAL_SECRET_FILE=
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ../../twin:/app/twin:z
-      - ../../gateway:/app/gateway:z
+      - ../../twin:/app/twin:ro,z
+      - ../../gateway:/app/gateway:ro,z
+      # Writable overlay for own persona data only (update_personality writes
+      # .md here). Peer persona path stays read-only via the twin mount above.
+      - ../../twin/march7/personas:/app/twin/march7/personas:z
       - ../../memories:/app/memories:z
       - ../../data:/app/data:z
-      - ../../.env:/app/.env:z
+      - ../../models:/app/models:ro,z
     healthcheck:
       # /health covers the Discord link, not just the HTTP server: a bot that
       # failed to log in leaves the process reachable but unable to reply.

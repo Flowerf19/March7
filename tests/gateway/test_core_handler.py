@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -180,5 +181,93 @@ async def test_non_march7_route_does_not_observe_march7_memory(monkeypatch):
 
     assert response == "core reply"
     assert router.calls[0]["agent_name"] == "evernight"
+    assert router.march7.memory.user_observations == []
+    assert router.march7.memory.channel_observations == []
+
+
+class FakeEvernightMemory:
+    def __init__(self) -> None:
+        self.observed: list[dict] = []
+
+    async def add_message(self, user_id: str, role: str, content: str) -> None:
+        self.observed.append({"user_id": user_id, "role": role, "content": content})
+
+
+class FakeEvernightAgent:
+    def __init__(self) -> None:
+        self.memory = FakeEvernightMemory()
+
+
+class FakeEvernightRouter:
+    march7 = None
+
+    def __init__(self) -> None:
+        self.evernight = FakeEvernightAgent()
+        self.calls: list[dict] = []
+
+    async def route(self, **kwargs) -> str:
+        self.calls.append(kwargs)
+        return "evernight reply"
+
+
+def _evernight_message(message_id: str, content: str) -> UnifiedMessage:
+    return UnifiedMessage(
+        message_id=message_id,
+        user=UnifiedUser(
+            platform_id="u1",
+            platform_name="mock",
+            display_name="User One",
+        ),
+        channel=UnifiedChannel(
+            channel_id="c1",
+            platform_name="mock",
+            channel_type="dm",
+        ),
+        content=content,
+        timestamp=datetime.now(timezone.utc),
+        extensions={
+            "agent_name": "evernight",
+            "is_addressed": True,
+            "should_respond": True,
+            "observe": True,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_evernight_burst_observes_every_input_replies_once(monkeypatch):
+    monkeypatch.setattr("gateway.core.handler.MESSAGE_DEBOUNCE_SECONDS", 0)
+    router = FakeEvernightRouter()
+    handler = GatewayChatHandler(agent_router=router)
+
+    messages = [_evernight_message(f"m{i}", f"burst {i}") for i in range(3)]
+    results = await asyncio.gather(*(handler.handle_message(msg) for msg in messages))
+
+    assert router.evernight.memory.observed == [
+        {"user_id": "u1", "role": "user", "content": f"burst {i}"} for i in range(3)
+    ]
+    assert results == ["", "", "evernight reply"]
+    assert len(router.calls) == 1
+    assert router.calls[0]["content"] == "burst 2"
+    assert router.calls[0]["observe_input"] is False
+
+
+@pytest.mark.asyncio
+async def test_evernight_without_local_memory_skips_local_observe(monkeypatch):
+    monkeypatch.setattr("gateway.core.handler.MESSAGE_DEBOUNCE_SECONDS", 0)
+    router = FakeRouter()
+    handler = GatewayChatHandler(agent_router=router)
+
+    response = await handler.handle_message(
+        _message(
+            extensions={
+                "agent_name": "evernight",
+                "is_addressed": True,
+                "observe": True,
+            }
+        )
+    )
+
+    assert response == "core reply"
     assert router.march7.memory.user_observations == []
     assert router.march7.memory.channel_observations == []

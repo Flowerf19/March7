@@ -11,7 +11,7 @@ services:
     networks:
       - march7_net
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     command: ["python", "-m", "twin.evernight"]
     depends_on:
       redis:
@@ -38,6 +38,9 @@ services:
       # Native System Gateway (runs on the host; HMAC shared secret from .env)
       - SYSTEM_GATEWAY_URL=http://host.docker.internal:8380
       - SYSTEM_GATEWAY_BOOTSTRAP_VENV=/opt/system-gateway/venv
+      # Owner approval key: FILE path only (value never in .env/repo).
+      # Host file below is mounted read-only into Evernight alone.
+      - SYSTEM_GATEWAY_APPROVAL_SECRET_FILE=/run/secrets/system_gateway_approval
 
       # Evernight background jobs
       - SELF_HEAL_ENABLED=true
@@ -45,13 +48,35 @@ services:
       - SELF_HEAL_TIMEOUT=10
       - INACTIVITY_SECONDS=1800
       - POLL_INTERVAL=60
+
+      # Peer credential isolation: env_file provides shared config, but the
+      # other agent's bot token must never reach this process. Explicit empty
+      # override wins over env_file (compose precedence: environment > env_file).
+      - DISCORD_MARCH7_TOKEN=
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ../../twin:/app/twin:z
-      - ../../gateway:/app/gateway:z
+      - ../../twin:/app/twin:ro,z
+      - ../../gateway:/app/gateway:ro,z
+      # Writable overlay for own persona data only (update_personality writes
+      # .md here). Peer persona path stays read-only via the twin mount above.
+      - ../../twin/evernight/personas:/app/twin/evernight/personas:z
       - ../../memories:/app/memories:z
-      - ../../.env:/app/.env:z
+      - ../../models:/app/models:ro,z
+      - ../../data:/app/data:z
+      # Host-private owner approval key (provisioned by `system-gateway pair`).
+      # Read-only into Evernight only; never mount into March7.
+      # Long bind: no auto-create (a missing file fails closed instead of
+      # creating a directory), read-only, SELinux shared label. Host path is
+      # configurable (nonsecret) so root (/etc/...) and user (~/.config/...)
+      # installs align; set SYSTEM_GATEWAY_APPROVAL_SECRET_HOST_PATH to override.
+      - type: bind
+        source: ${SYSTEM_GATEWAY_APPROVAL_SECRET_HOST_PATH:-${HOME}/.config/system-gateway/approval_secret}
+        target: /run/secrets/system_gateway_approval
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
     healthcheck:
       # /health covers the Discord link, not just the HTTP server: a bot that
       # failed to log in leaves the process reachable but unable to reply.

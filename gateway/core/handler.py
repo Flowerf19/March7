@@ -84,6 +84,8 @@ class GatewayChatHandler(GatewayHandler):
 
         if should_observe and agent_name == "march7":
             await self._observe_message(msg, content)
+        elif should_observe and agent_name == "evernight":
+            await self._observe_evernight_message(msg, content)
 
         if not should_respond:
             return ""
@@ -194,6 +196,22 @@ class GatewayChatHandler(GatewayHandler):
             message_id=msg.message_id,
             content=content,
             reply_to=msg.reply_to,
+        )
+
+    async def _observe_evernight_message(self, msg: UnifiedMessage, content: str) -> None:
+        # Persist one Evernight input BEFORE the reply debounce so a burst
+        # keeps every entry. Only the router's local Evernight agent memory is
+        # used; when Evernight is remote (A2A client) there is nothing local to
+        # persist to and the server-side handle_chat observes with its default.
+        # March7 T1 is never touched here.
+        if not self._agent_router:
+            return
+        agent = getattr(self._agent_router, "evernight", None)
+        memory = getattr(agent, "memory", None)
+        if memory is None:
+            return
+        await memory.add_message(
+            user_id=msg.user.platform_id, role="user", content=content
         )
 
     def _get_lock(self, scope_key: str) -> asyncio.Lock:

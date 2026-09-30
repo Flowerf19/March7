@@ -2,6 +2,7 @@
 #
 # Keep only values that genuinely vary per deployment. Defaults that rarely
 # need tuning live as plain constants below the Config class.
+import logging
 import os
 
 
@@ -25,6 +26,13 @@ SYSTEM_GATEWAY_TIMEOUT_DEFAULT = 30
 # orchestrator; the time/topic knobs were never wired.
 SEARCH_TOP_K_SEMANTIC_DEFAULT = 5
 SEARCH_MIN_RELEVANCE_DEFAULT = 0.3
+
+# Harrier-calibrated T2 cosine gates (2026-09-30, real harrier-oss-v1-270m q4
+# ONNX, deployed query/passage prefixes; probes in scripts/calibrate_t2.py
+# --offline). Owner may still override via env; below-default explicit values
+# log a warning at import (see _warn_if_legacy_t2_gate).
+T2_MIN_COSINE_DEFAULT = 0.60
+T2_MERGE_MIN_COSINE_DEFAULT = 0.75
 
 
 class Config:
@@ -135,20 +143,31 @@ class Config:
     # === Evernight A2A endpoint (March7 calls Evernight) ===
     EVERNIGHT_A2A_URL = os.getenv("EVERNIGHT_A2A_URL", "http://evernight:8001")
 
+    # === March7 A2A endpoint (Evernight calls March7) ===
+    MARCH7_URL = os.getenv("MARCH7_URL", "http://march7:8000")
+
+    # === A2A peer authentication (HMAC shared secret) ===
+    # Deployed via shared .env (both agents must hold the same value).
+    A2A_SHARED_SECRET = os.getenv("A2A_SHARED_SECRET") or None
+
+    # === Owner approval authority (Evernight-issued grants) ===
+    # Explicit owner platform user id. Empty/None means unknown -> deny.
+    # No hardcoded fallback: authority must be configured, never assumed.
+    EVERNIGHT_OWNER_USER_ID = os.getenv("EVERNIGHT_OWNER_USER_ID") or None
+    # Host-private approval-key FILE path. The key VALUE is never in env or
+    # the shared repo .env; the file is mounted read-only into Evernight
+    # only (March7 must never read it).
+    SYSTEM_GATEWAY_APPROVAL_SECRET_FILE = os.getenv(
+        "SYSTEM_GATEWAY_APPROVAL_SECRET_FILE", "/run/secrets/system_gateway_approval"
+    )
+
     # === Search Memory ===
     SEARCH_TOP_K_SEMANTIC = SEARCH_TOP_K_SEMANTIC_DEFAULT
     SEARCH_MIN_RELEVANCE = SEARCH_MIN_RELEVANCE_DEFAULT
 
-    # === Embedding model ===
-    # Supported providers (see twin/shared/llm/embedding/embedding_factory.py):
-    #   - openai_compat (aliases: openai, qwen) -> OpenAIEmbeddingService
-    #     Works with OpenAI, Qwen/DashScope, Voyage, LM Studio, OpenRouter, ...
-    #   - gemini (alias: google) -> GeminiEmbeddingService
-    EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai_compat")
-    EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-v3")
-    EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
-    EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
-    EMBEDDING_VECTOR_SIZE = int(os.getenv("EMBEDDING_VECTOR_SIZE", "1024"))
+    # === Embedding model (local Harrier q4 ONNX only, no API) ===
+    HARRIER_MODEL_DIR = os.getenv("HARRIER_MODEL_DIR", "models/harrier-q4")
+    EMBEDDING_VECTOR_SIZE = int(os.getenv("EMBEDDING_VECTOR_SIZE", "640"))
     EMBEDDING_TRACE_LOG_ENABLED = (
         os.getenv("EMBEDDING_TRACE_LOG_ENABLED", "false").lower() == "true"
     )
@@ -170,16 +189,21 @@ class Config:
     ).replace("\\n", "\n")
     EMBEDDING_PASSAGE_PREFIX = os.getenv("EMBEDDING_PASSAGE_PREFIX", "").replace("\\n", "\n")
     # T2 semantic-recall relevance gate: drop KNN hits whose cosine similarity
-    # is below this before injecting into the prompt. 0.0 = off (legacy). A weak
-    # embedding model (e.g. e5-small on Vietnamese) collapses all cosines into a
-    # narrow high band, so this only bites once a discriminating model is used.
-    T2_MIN_COSINE = float(os.getenv("T2_MIN_COSINE", "0.0"))
+    # is below this before injecting into the prompt.
+    # Harrier default 0.60 (2026-09-30, real q4 ONNX, 19 labeled queries +
+    # 19 negatives: precision 1.00, recall 0.79; noise peaks 0.588, clear
+    # positives >= 0.626, midpoint 0.607). Vague sub-gate queries return no
+    # memory rather than wrong memory. Legacy Qwen-era values (0.0/0.35/0.42/
+    # 0.45) admit cross-topic noise with Harrier (pet<->hiking 0.64,
+    # weather-query<->hiking 0.52) — explicit below-default values warn at import.
+    T2_MIN_COSINE = float(os.getenv("T2_MIN_COSINE", str(T2_MIN_COSINE_DEFAULT)))
     # T2 diary model (write path). A new summary is merged into an existing
     # same-user same-VN-day doc when their cosine similarity reaches this
-    # floor (calibrated 2026-07-03: same-topic follow-ups 0.507–0.782,
-    # cross-topic max 0.526 — biased high because a missed merge just appends
-    # like before, while a false merge glues unrelated topics together).
-    T2_MERGE_MIN_COSINE = float(os.getenv("T2_MERGE_MIN_COSINE", "0.60"))
+    # floor. Harrier default 0.75 (2026-09-30: same-event follow-ups
+    # 0.82-0.93 all merge; cross-topic max 0.71 blocked; missed merges safely
+    # append, while a false merge glues unrelated topics together). Legacy
+    # Qwen-era 0.60 false-merges 26/60 cross-topic pairs with Harrier.
+    T2_MERGE_MIN_COSINE = float(os.getenv("T2_MERGE_MIN_COSINE", str(T2_MERGE_MIN_COSINE_DEFAULT)))
     # Char cap for a merged diary doc: beyond this, append a new doc instead
     # of growing a mega-doc whose embedding averages into mush.
     T2_MERGE_MAX_CHARS = int(os.getenv("T2_MERGE_MAX_CHARS", "1500"))
@@ -188,3 +212,29 @@ class Config:
     # an archive failure never blocks the trim.
     T1_ARCHIVE_ENABLED = os.getenv("T1_ARCHIVE_ENABLED", "true").lower() == "true"
     T1_ARCHIVE_TTL_DAYS = int(os.getenv("T1_ARCHIVE_TTL_DAYS", "90"))
+
+
+def _warn_if_legacy_t2_gate(env_name: str, default: float, legacy: str) -> None:
+    """Warn when an explicit T2 gate override sits below the Harrier default.
+
+    Overrides stay owner-configurable and are respected; the warning exists
+    because pre-Harrier values silently cause false recalls/merges. Unset or
+    unparsable values stay quiet (unparsable ones fail loudly at float()).
+    """
+    raw = os.getenv(env_name)
+    if raw is None:
+        return
+    try:
+        value = float(raw)
+    except ValueError:
+        return
+    if value < default:
+        logging.getLogger(__name__).warning(
+            "%s=%s is below the Harrier-calibrated default %.2f (%s); "
+            "pre-Harrier values cause false recalls/merges — override respected.",
+            env_name, raw, default, legacy,
+        )
+
+
+_warn_if_legacy_t2_gate("T2_MIN_COSINE", T2_MIN_COSINE_DEFAULT, "legacy Qwen-era 0.0/0.35/0.42/0.45")
+_warn_if_legacy_t2_gate("T2_MERGE_MIN_COSINE", T2_MERGE_MIN_COSINE_DEFAULT, "legacy Qwen-era 0.60")

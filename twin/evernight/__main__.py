@@ -15,6 +15,16 @@ setup_logging()
 logger = logging.getLogger("evernight.main")
 
 
+def _notify_user_id(owner_user_id: str | int | None) -> int | None:
+    """Parse owner for self-heal DM; unknown/malformed fails closed (None)."""
+    if owner_user_id is None or isinstance(owner_user_id, bool):
+        return None
+    if isinstance(owner_user_id, int):
+        return owner_user_id if owner_user_id >= 0 else None
+    text = str(owner_user_id).strip()
+    return int(text) if text.isdigit() else None
+
+
 async def main():
     from twin.evernight.config import EvernightConfig
     from twin.evernight.container import EvernightContainer
@@ -58,7 +68,7 @@ async def main():
             interval=config.self_heal_interval,
             timeout=config.self_heal_timeout,
             discord_adapter=evernight_adapter,
-            notify_user_id=int(config.owner_user_id),
+            notify_user_id=_notify_user_id(config.owner_user_id),
             gateway_monitor=container.gateway_monitor,
         )
         await self_heal.start()

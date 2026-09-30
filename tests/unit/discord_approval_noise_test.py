@@ -10,7 +10,7 @@ import pytest
 
 TARGET_MODULES = (
     "gateway.adapters.discord.views.approve_view",
-    "twin.evernight.server.a2a_server",
+    "gateway.adapters.discord.dm_delivery",
 )
 
 
@@ -56,13 +56,9 @@ def fake_discord(monkeypatch):
     commands.Bot = type("Bot", (), {})
     discord_ext.commands = commands
 
-    evernight_agent = ModuleType("twin.evernight.agent")
-    evernight_agent.EvernightAgent = type("EvernightAgent", (), {})
-
     monkeypatch.setitem(sys.modules, "discord", discord)
     monkeypatch.setitem(sys.modules, "discord.ext", discord_ext)
     monkeypatch.setitem(sys.modules, "discord.ext.commands", commands)
-    monkeypatch.setitem(sys.modules, "twin.evernight.agent", evernight_agent)
 
     yield discord
 
@@ -76,13 +72,18 @@ async def test_approve_view_keeps_decision_when_message_update_disappears(
     caplog,
 ):
     module = importlib.import_module("gateway.adapters.discord.views.approve_view")
-    view = module.ApproveView(command="printf ok")
+    view = module.ApproveView(command="printf ok", owner_user_id="111")
 
     class _Response:
         async def edit_message(self, **_kwargs):
             raise fake_discord.NotFound("message gone")
 
-    interaction = SimpleNamespace(response=_Response())
+        async def send_message(self, *args, **_kwargs):
+            return None
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=111), response=_Response()
+    )
 
     with caplog.at_level(logging.WARNING):
         await view.approve_button(interaction, None)
@@ -95,11 +96,11 @@ async def test_approve_view_keeps_decision_when_message_update_disappears(
 
 
 @pytest.mark.asyncio
-async def test_evernight_notify_original_channel_skips_inaccessible_channel(
+async def test_dm_delivery_notify_skips_inaccessible_channel(
     fake_discord,
     caplog,
 ):
-    module = importlib.import_module("twin.evernight.server.a2a_server")
+    module = importlib.import_module("gateway.adapters.discord.dm_delivery")
 
     class _Bot:
         def is_ready(self):
@@ -111,10 +112,10 @@ async def test_evernight_notify_original_channel_skips_inaccessible_channel(
         async def fetch_channel(self, _channel_id):
             raise fake_discord.Forbidden("missing access")
 
-    handler = module.EvernightA2AHandler(agent=object(), discord_bot=_Bot())
+    delivery = module.DiscordDMDelivery(_Bot())
 
     with caplog.at_level(logging.WARNING):
-        await handler._notify_original_channel(123, None, "printf ok", True)
+        await delivery.notify_channel(channel_id=123, approved=True, label="printf ok")
 
     assert (
         "Skipping approval result notification for inaccessible channel 123"

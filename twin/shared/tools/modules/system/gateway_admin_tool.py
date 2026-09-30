@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from twin.evernight.host_gateway import installer
 from twin.evernight.host_gateway.monitor import GatewayMonitor
-from twin.shared.system_gateway.auth import mint_approval_token
 from twin.shared.tools.approval_context import get_current_approval_context
 from twin.shared.tools.registry.base import BaseTool
+
+if TYPE_CHECKING:
+    from twin.shared.tools.approval_gate import ApprovalGate
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,7 @@ class GatewayAdminTool(BaseTool):
         base_url: str | None = None,
         shared_secret: str | None = None,
         timeout: int = 10,
+        approval_gate: ApprovalGate | None = None,
     ):
         self.owner_user_id = str(owner_user_id)
         self._gateway_monitor = gateway_monitor
@@ -35,6 +38,7 @@ class GatewayAdminTool(BaseTool):
         self._base_url = base_url
         self._shared_secret = shared_secret
         self._timeout = timeout
+        self._approval_gate = approval_gate
 
     @property
     def name(self) -> str:
@@ -88,6 +92,14 @@ class GatewayAdminTool(BaseTool):
         context = get_current_approval_context()
         if context is None:
             logger.warning("gateway_admin: no approval context; rejecting as non-owner")
+            return False
+        # Trusted platform gate: only the Discord adapter derives owner
+        # context. A2A sessionId is peer-chosen and never proves ownership.
+        if getattr(context, "platform", None) != "discord":
+            logger.warning(
+                "gateway_admin: non-discord platform %r rejected as non-owner",
+                getattr(context, "platform", None),
+            )
             return False
         caller = str(context.user_id or "").strip()
         owner = self.owner_user_id.strip()
@@ -147,21 +159,29 @@ class GatewayAdminTool(BaseTool):
         if base_url is None:
             return "❌ Gateway base URL chưa được cấu hình."
 
-        approval_id = None
         secret = self._shared_secret
         if secret is None and self._host_gateway_client is not None:
             secret = getattr(self._host_gateway_client, "shared_secret", None)
         if not secret:
             return "❌ Gateway shared secret chưa được cấu hình."
+        if self._approval_gate is None:
+            return "❌ Owner approval chưa được cấu hình (DM approval unavailable)."
+        # Owner context alone is not consent to a version-changing action.
+        # Every update needs an explicit owner button approval bound to the
+        # exact current/target versions; this tool only consumes the grant.
+        decision = await self._approval_gate.authorize_host(
+            action="self.update",
+            actor="evernight",
+            from_version=current_version,
+            to_version=target_version,
+        )
+        if not decision.approved or not decision.grant:
+            reason = decision.reason or "bị từ chối"
+            return f"❌ Update bị từ chối bởi owner approval ({reason})."
+        approval_id = decision.grant
         actor = "evernight"
         if self._host_gateway_client is not None:
             actor = getattr(self._host_gateway_client, "actor", actor)
-        if secret:
-            approval_id = mint_approval_token(
-                secret=secret,
-                action="self.update",
-                actor=actor,
-            )
 
         coordinator = installer.InstallerCoordinator(
             base_url=base_url,

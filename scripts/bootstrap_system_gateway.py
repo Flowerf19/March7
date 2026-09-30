@@ -9,21 +9,26 @@ root:
     Windows (admin shell):  python scripts\\bootstrap_system_gateway.py
 
 What it does (in order):
-  1. Ensure a shared secret exists — reuse SYSTEM_GATEWAY_SHARED_SECRET from
-     ``.env`` if present, otherwise generate one and write it to both the
+  1. Ensure a shared request secret exists — reuse SYSTEM_GATEWAY_SHARED_SECRET
+     from ``.env`` if present, otherwise generate one and write it to both the
      host secret file and ``.env`` so the agent (in Docker) and the gateway
-     (on host) share the same secret.
-  2. Create the gateway virtualenv.
-  3. ``pip install`` the system_gateway package into that venv.
-  4. ``system-gateway install`` registers + starts the native service on
+     (on host) share the same request-signing secret.
+  2. Ensure a SEPARATE owner approval key exists in a host-private file
+     outside the repo (0600, never printed, never written to the shared
+     ``.env``). Only the gateway service, Evernight (via a dedicated mount),
+     and the owner CLI may hold it; March7 must never receive it.
+  3. Create the gateway virtualenv.
+  4. ``pip install`` the system_gateway package into that venv.
+  5. ``system-gateway install`` registers + starts the native service on
      Linux/macOS. Windows is foreground-only for now, so the script prints the
      run command instead of registering a service.
-  5. Restart the service and run a health check.
+  6. Restart the service and run a health check.
 
 Requires Python 3.11+. Idempotent — safe to re-run.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import secrets
 import subprocess
@@ -99,8 +104,39 @@ def ensure_privilege() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Platform defaults
+# Platform defaults (unified stdlib-only resolvers, no duplication)
 # --------------------------------------------------------------------------- #
+_PATHS_CACHE = None
+
+
+def _unified_paths():
+    """Load services/system_gateway/paths.py without an installed package.
+
+    Bootstrap runs BEFORE `pip install`, so it cannot `import system_gateway`
+    (that would also pull aiohttp via __init__). Load the stdlib-only
+    paths module repo-relative by file path. Reuse the already-imported
+    module in tests so platform/UID mocks stay coherent across resolvers.
+    """
+
+    global _PATHS_CACHE
+    if _PATHS_CACHE is not None:
+        return _PATHS_CACHE
+    already = sys.modules.get("system_gateway.paths")
+    if already is not None:
+        _PATHS_CACHE = already
+        return already
+    paths_file = PKG_DIR / "paths.py"
+    spec = importlib.util.spec_from_file_location(
+        "system_gateway_bootstrap_paths", paths_file
+    )
+    if spec is None or spec.loader is None:
+        die(f"path helpers not found at {paths_file}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _PATHS_CACHE = module
+    return module
+
+
 def default_venv() -> Path:
     if VENV:
         return Path(VENV)
@@ -112,15 +148,17 @@ def default_venv() -> Path:
 
 
 def config_dir() -> Path:
-    if IS_MAC:
-        return Path.home() / "Library" / "Application Support" / "system-gateway"
-    if IS_WIN:
-        return Path(os.getenv("ProgramData", "C:\\ProgramData")) / "system-gateway"
-    return Path("/etc/system-gateway")
+    return _unified_paths().default_config_dir()
 
 
 def secret_file_path() -> Path:
-    return config_dir() / "secret"
+    return _unified_paths().default_shared_secret_file()
+
+
+def approval_secret_file_path() -> Path:
+    """Host-private path for the owner approval key (outside repo, never .env)."""
+
+    return _unified_paths().default_approval_secret_file()
 
 
 # --------------------------------------------------------------------------- #
@@ -163,6 +201,62 @@ def ensure_env_key(key: str, value: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Secret
 # --------------------------------------------------------------------------- #
+def _write_new_secret_0600(path: Path, secret: str) -> bool:
+    """Exclusively create a 0600 secret file; False when it already exists."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(secret)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return True
+
+
+def _overwrite_secret_atomic_0600(path: Path, secret: str) -> None:
+    """Atomically publish a 0600 secret file (explicit overwrite only)."""
+
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".tmp-secret-"
+    )
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(secret)
+        os.replace(tmp_name, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+
+
 def ensure_secret() -> str:
     sf = secret_file_path()
     env_secret = read_env_value("SYSTEM_GATEWAY_SHARED_SECRET")
@@ -176,12 +270,7 @@ def ensure_secret() -> str:
         secret = secrets.token_urlsafe(32)
         info("Generated new shared secret.")
 
-    sf.parent.mkdir(parents=True, exist_ok=True)
-    sf.write_text(secret, encoding="utf-8")
-    try:
-        os.chmod(sf, 0o600)
-    except OSError:
-        pass
+    _overwrite_secret_atomic_0600(sf, secret)
 
     written_env = ensure_env_key("SYSTEM_GATEWAY_SHARED_SECRET", secret)
     if written_env:
@@ -191,6 +280,31 @@ def ensure_secret() -> str:
     else:
         info("Secret already matches between host file and .env; no change needed.")
     return secret
+
+
+def ensure_approval_secret() -> Path:
+    """Ensure the host-private owner approval key file exists. Returns its path.
+
+    The key value is never printed and never written to the shared repo .env
+    (which is bind-mounted into both agents). Existing files are kept unless
+    empty; pass no force flag here — rotation is an explicit owner action.
+    """
+
+    sf = approval_secret_file_path()
+    if sf.exists():
+        existing = sf.read_text(encoding="utf-8").strip() or None
+        if existing:
+            info(f"Owner approval key already exists at {sf} (kept, not shown).")
+            return sf
+    secret = secrets.token_urlsafe(32)
+    if not _write_new_secret_0600(sf, secret):
+        # Lost a concurrent creation race; keep the winner, never overwrite.
+        info(f"Owner approval key already exists at {sf} (kept, not shown).")
+        return sf
+    info(f"Generated owner approval key at {sf} (value not shown, 0600).")
+    info("Mount this file read-only into Evernight only; never into March7.")
+    info("Never copy this value into the shared repo .env.")
+    return sf
 
 
 # --------------------------------------------------------------------------- #
@@ -279,7 +393,9 @@ def main() -> int:
     info(f"Host={HOST} Port={PORT}")
     info(f"Venv: {default_venv()}")
     info(f"Secret file: {secret_file_path()}")
+    info(f"Approval key file: {approval_secret_file_path()}")
     ensure_secret()
+    ensure_approval_secret()
     vp = ensure_venv()
     pip_install(vp)
     gateway_install(vp)

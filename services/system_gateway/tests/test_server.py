@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from aiohttp.test_utils import make_mocked_request
 import pytest
 
@@ -7,9 +9,16 @@ from system_gateway.config import GatewayConfig
 from system_gateway.server import CONFIG_KEY, STATE_KEY, capabilities, create_app, health
 
 
+def _test_config(tmp_path: Path, **overrides) -> GatewayConfig:
+    # Explicit private ledger; never the real host default.
+    kwargs = dict(approval_ledger_file=tmp_path / "ledger.db")
+    kwargs.update(overrides)
+    return GatewayConfig(**kwargs)
+
+
 @pytest.mark.asyncio
-async def test_health_response() -> None:
-    app = create_app(GatewayConfig())
+async def test_health_response(tmp_path: Path) -> None:
+    app = create_app(_test_config(tmp_path))
     request = make_mocked_request("GET", "/health")
     request._app = app
 
@@ -31,8 +40,8 @@ async def test_health_response() -> None:
 
 
 @pytest.mark.asyncio
-async def test_capabilities_response() -> None:
-    app = create_app(GatewayConfig())
+async def test_capabilities_response(tmp_path: Path) -> None:
+    app = create_app(_test_config(tmp_path))
     request = make_mocked_request("GET", "/capabilities")
     request._app = app
 
@@ -43,8 +52,8 @@ async def test_capabilities_response() -> None:
     assert "raw_shell" in response.text
 
 
-def test_create_app_registers_routes() -> None:
-    app = create_app(GatewayConfig(host="0.0.0.0", port=9999))
+def test_create_app_registers_routes(tmp_path: Path) -> None:
+    app = create_app(_test_config(tmp_path, host="0.0.0.0", port=9999))
 
     route_paths = {
         route.resource.canonical
@@ -52,7 +61,7 @@ def test_create_app_registers_routes() -> None:
         if route.resource is not None
     }
 
-    assert app[CONFIG_KEY] == GatewayConfig(host="0.0.0.0", port=9999)
+    assert app[CONFIG_KEY] == _test_config(tmp_path, host="0.0.0.0", port=9999)
     assert app[STATE_KEY] is not None
     assert route_paths == {
         "/health",

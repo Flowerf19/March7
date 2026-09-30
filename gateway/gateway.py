@@ -29,6 +29,7 @@ class ChatGateway:
     def __init__(self, handler: GatewayHandler) -> None:
         self._handler = handler
         self._adapters: dict[str, PlatformAdapter] = {}
+        self._reconnect_tasks: dict[str, asyncio.Task] = {}
         self._running = False
 
     # ------------------------------------------------------------------
@@ -44,8 +45,15 @@ class ChatGateway:
         """Remove and disconnect the adapter identified by *name*."""
         adapter = self._adapters.pop(name, None)
         if adapter:
+            self._cancel_reconnect(name)
             asyncio.create_task(self._safe_disconnect(name, adapter))
             logger.info("Unregistered platform adapter: %s", name)
+
+    def _cancel_reconnect(self, name: str) -> None:
+        """Cancel a tracked reconnect loop so it cannot resurrect *name*."""
+        task = self._reconnect_tasks.pop(name, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _safe_disconnect(
         self, name: str, adapter: PlatformAdapter
@@ -75,13 +83,25 @@ class ChatGateway:
                     name,
                 )
                 # Start reconnection loop in background.
-                asyncio.create_task(
+                self._cancel_reconnect(name)
+                self._reconnect_tasks[name] = asyncio.create_task(
                     self._reconnect_loop(name, adapter)
                 )
 
     async def stop_all(self) -> None:
         """Disconnect all adapters gracefully."""
         self._running = False
+        # Cancel reconnect loops first so none can reconnect after disconnect.
+        tasks = list(self._reconnect_tasks.values())
+        self._reconnect_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         for name, adapter in self._adapters.items():
             try:
                 await adapter.disconnect()
@@ -93,6 +113,16 @@ class ChatGateway:
         self, name: str, adapter: PlatformAdapter
     ) -> None:
         """Exponential-backoff reconnection for a single adapter."""
+        current = asyncio.current_task()
+        try:
+            await self._reconnect_loop_inner(name, adapter)
+        finally:
+            if self._reconnect_tasks.get(name) is current:
+                self._reconnect_tasks.pop(name, None)
+
+    async def _reconnect_loop_inner(
+        self, name: str, adapter: PlatformAdapter
+    ) -> None:
         attempt = 0
         while self._running and attempt < MAX_RECONNECT_RETRIES:
             delay = RECONNECT_BASE_DELAY * (2 ** attempt)
@@ -101,10 +131,13 @@ class ChatGateway:
                 name, delay, attempt + 1, MAX_RECONNECT_RETRIES,
             )
             await asyncio.sleep(delay)
+            # stop_all/unregister may have run during the backoff sleep.
+            if not self._running:
+                return
+            if self._adapters.get(name) is not adapter:
+                return
             try:
                 await adapter.connect()
-                logger.info("Adapter %s reconnected on attempt %d", name, attempt + 1)
-                return  # Success — exit loop.
             except RuntimeError as e:
                 # Config errors (missing token, etc.) — won't be fixed by retrying.
                 logger.error(
@@ -129,6 +162,19 @@ class ChatGateway:
                         attempt + 1, name,
                     )
                 attempt += 1
+                continue
+            # connect() awaited through a stop/unregister boundary — recheck
+            # before treating this as a live link.
+            if not self._running or self._adapters.get(name) is not adapter:
+                try:
+                    await adapter.disconnect()
+                except Exception:
+                    logger.exception(
+                        "Error disconnecting stale reconnect for adapter %s", name
+                    )
+                return
+            logger.info("Adapter %s reconnected on attempt %d", name, attempt + 1)
+            return
 
         if self._running:
             logger.error(

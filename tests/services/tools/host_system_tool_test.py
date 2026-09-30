@@ -3,21 +3,41 @@ import pytest
 from twin.shared.system_gateway import (
     GatewayActionResponse,
     GatewayCapabilities,
+    canonical_approval_action,
+    mint_approval_token,
     verify_approval_token,
 )
+from twin.shared.tools.approval_context import ApprovalDecision
 from twin.shared.tools.modules.system.host_system_tool import HostSystemTool
 
 
 TEST_SECRET = "tool-shared-secret"
+OWNER_SECRET = "toy-owner-approval-key-1"
 
 
 class FakeApprovalGate:
-    def __init__(self, result=True):
+    """Toy Evernight issuer: mints OWNER-secret grants bound to exact execution."""
+
+    def __init__(self, result=True, owner_secret=OWNER_SECRET):
         self.result = result
+        self.owner_secret = owner_secret
         self.calls = []
+        self.last_grant = None
+
+    async def authorize_host(self, *, action, command=None, shell=None, cwd=None, timeout=None, actor="march7", **_kwargs):
+        self.calls.append(
+            {"action": action, "command": command, "shell": shell, "cwd": cwd, "timeout": timeout, "actor": actor}
+        )
+        if not self.result:
+            return ApprovalDecision.denied("rejected")
+        canonical = canonical_approval_action(
+            action, {"command": command or "", "shell": shell, "cwd": cwd, "timeout": timeout}
+        )
+        grant = mint_approval_token(secret=self.owner_secret, action=canonical, actor=actor)
+        self.last_grant = grant
+        return ApprovalDecision.approved_with_grant(grant)
 
     async def check_approval(self, tool_name, command):
-        self.calls.append((tool_name, command))
         return self.result
 
 
@@ -85,15 +105,20 @@ async def test_shell_requires_approval_before_gateway_call():
     result = await tool.execute(mode="shell", command="uptime")
 
     assert "shell ok" in result
-    assert approval.calls[0] == ("host_system", "host shell: uptime")
+    assert approval.calls[0]["action"] == "shell"
+    assert approval.calls[0]["command"] == "uptime"
+    assert approval.calls[0]["actor"] == "march7"
     assert client.shell_calls[0].command == "uptime"
-    # A valid action-bound token (action="shell") is minted and attached.
+    # March7 consumes the issuer grant as-is; it never mints.
     token = client.shell_calls[0].approval_id
     assert token
-    result_token = verify_approval_token(
-        secret=TEST_SECRET, token=token, action="shell", actor="march7"
+    assert token == approval.last_grant
+    expected = canonical_approval_action(
+        "shell", {"command": "uptime", "shell": None, "cwd": None, "timeout": 30}
     )
-    assert result_token.valid is True
+    assert verify_approval_token(secret=OWNER_SECRET, token=token, action=expected, actor="march7").valid is True
+    # Request-signing key cannot verify an owner-bound grant.
+    assert verify_approval_token(secret=TEST_SECRET, token=token, action=expected, actor="march7").valid is False
 
 
 @pytest.mark.asyncio
@@ -106,6 +131,7 @@ async def test_shell_without_shared_secret_is_blocked():
 
     assert "shared secret" in result
     assert client.shell_calls == []
+    assert approval.calls == []
 
 
 @pytest.mark.asyncio
@@ -118,6 +144,7 @@ async def test_rejected_shell_does_not_call_gateway():
 
     assert "bị từ chối" in result
     assert client.shell_calls == []
+    assert len(approval.calls) == 1
 
 
 @pytest.mark.asyncio

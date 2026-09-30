@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 
 import pytest
 
+from types import SimpleNamespace
+from unit.memory.journal_fake import JournalFakeRedis
 from twin.shared.memory.active import ActiveEntry
 from twin.shared.tools.modules.memory.consolidate_memory_tool import ConsolidateMemoryTool
 
@@ -19,29 +21,38 @@ from twin.shared.tools.modules.memory.consolidate_memory_tool import Consolidate
 class FakeT1:
     def __init__(self) -> None:
         self.get_context_calls: list[dict] = []
+        self._entries: list = []
+        self.store = SimpleNamespace(redis=FakePlanRedis())
 
     async def get_context(self, scope, scope_id, *, limit: int = 50):
         self.get_context_calls.append({"scope": scope, "scope_id": scope_id, "limit": limit})
         return []
 
+    async def get_entries_by_ids(self, scope, scope_id, entry_ids):
+        by_id = {e.entry_id: e for e in self._entries}
+        return [by_id[i] for i in entry_ids if i in by_id]
+
+    async def list_unsummarized_entries(self, scope, scope_id, limit=200):
+        return list(self._entries[-limit:])
+
 
 class FakeProfileStore:
     def __init__(self) -> None:
         self.read_raw_calls: list[str] = []
-        self.append_raw_calls: list[tuple] = []
-        self.replace_section_calls: list[tuple] = []
+        self.atomic_calls: list[tuple] = []
 
     async def read_raw(self, scope_id):
         self.read_raw_calls.append(scope_id)
         return ""
 
-    async def append_raw(self, scope_id, section, bullet, source_memory_id=None):
-        self.append_raw_calls.append((scope_id, section, bullet))
-        return True
-
-    async def replace_section(self, scope_id, section, bullets, expected_profile_hash=None):
-        self.replace_section_calls.append((scope_id, section, list(bullets)))
-        return {"ok": True, "conflict": False, "section": section, "written": True}
+    async def apply_consolidation_updates(self, scope_id, rewrites, appends, expected_profile_hash):
+        self.atomic_calls.append((scope_id, dict(rewrites or {}), dict(appends or {})))
+        rewritten = [s for s, b in (rewrites or {}).items() if b]
+        updated = [s for s, b in (appends or {}).items() if b and s not in rewritten]
+        return {
+            "ok": True, "conflict": False, "written": True,
+            "updated_sections": updated, "rewritten_sections": rewritten,
+        }
 
 
 class FakeMemoryManager:
@@ -74,13 +85,18 @@ class FakeEmbeddingService:
         return [0.1] * 8
 
 
+class FakePlanRedis(JournalFakeRedis):
+    """Real-behavior async Redis string surface + journal EVAL subset."""
+
+
 class FakeTimelineStore:
     def __init__(self) -> None:
+        self.redis = FakePlanRedis()
         self.store_calls: list[dict] = []
 
     async def store_summary(
         self, *, user_id, summary, embedding, topic, topic_display, importance,
-        period_start=None, period_end=None, source_entry_ids=None,
+        period_start=None, period_end=None, source_entry_ids=None, idempotency_key=None,
     ):
         self.store_calls.append({
             "user_id": user_id,
@@ -90,6 +106,7 @@ class FakeTimelineStore:
             "period_start": period_start,
             "period_end": period_end,
             "source_entry_ids": source_entry_ids,
+            "idempotency_key": idempotency_key,
         })
         return f"sum-{topic}"
 
@@ -99,11 +116,12 @@ class FakeTimelineStoreAllFail:
     Redis error). Every topic store attempt fails, so nothing lands in T2."""
 
     def __init__(self) -> None:
+        self.redis = FakePlanRedis()
         self.calls = 0
 
     async def store_summary(
         self, *, user_id, summary, embedding, topic, topic_display, importance,
-        period_start=None, period_end=None, source_entry_ids=None,
+        period_start=None, period_end=None, source_entry_ids=None, idempotency_key=None,
     ):
         self.calls += 1
         raise ValueError("embedding dim mismatch")
@@ -206,7 +224,7 @@ async def test_channel_scope_skips_profile_read_and_write():
     # Channel scope must neither read nor write memories/<channel_id>.md, even
     # though the LLM returned non-empty profile_updates.
     assert memory.profile.read_raw_calls == []
-    assert memory.profile.append_raw_calls == []
+    assert memory.profile.atomic_calls == []
     assert result["updated_sections"] == []
 
 
@@ -334,11 +352,6 @@ async def test_store_receives_period_from_local_active_entries():
     )
     memory.t1._entries = [e1, e2]
 
-    async def get_context(scope, scope_id, *, limit=50):
-        return [e1, e2]
-
-    memory.t1.get_context = get_context
-
     store = FakeTimelineStore()
     tool = ConsolidateMemoryTool(
         memory_manager=memory,
@@ -385,7 +398,7 @@ async def test_entries_without_timestamps_fall_back_to_consolidate_time():
 
 
 @pytest.mark.asyncio
-async def test_profile_rewrites_replace_section_and_suppress_duplicate_appends():
+async def test_profile_rewrites_apply_atomically_and_suppress_duplicate_appends():
     memory = FakeMemoryManager()
     tool = ConsolidateMemoryTool(
         memory_manager=memory,
@@ -402,17 +415,16 @@ async def test_profile_rewrites_replace_section_and_suppress_duplicate_appends()
     )
 
     assert result["status"] == "ok"
-    # Rewrite landed via replace_section with the full clean bullet list;
-    # the empty "habit" rewrite was ignored (would have wiped the section).
-    assert memory.profile.replace_section_calls == [
-        ("u1", "interest", ["Hết thích game X", "Vẫn mê board game"]),
+    # One atomic apply carrying rewrites + appends; the empty "habit"
+    # rewrite never reaches the store (would wipe the section).
+    assert memory.profile.atomic_calls == [
+        ("u1",
+         {"interest": ["Hết thích game X", "Vẫn mê board game"]},
+         {"interest": ["Hết thích game X"], "work": ["Đang làm dự án Y"]}),
     ]
     assert result["rewritten_sections"] == ["interest"]
     # The rewritten section must NOT also be appended (would re-duplicate);
     # the untouched "work" section still goes through the normal append path.
-    appended_sections = {c[1] for c in memory.profile.append_raw_calls}
-    assert "interest" not in appended_sections
-    assert appended_sections == {"work"}
     assert result["updated_sections"] == ["work"]
 
 
@@ -434,21 +446,20 @@ async def test_channel_scope_skips_profile_rewrites_too():
     )
 
     assert result["status"] == "ok"
-    assert memory.profile.replace_section_calls == []
-    assert memory.profile.append_raw_calls == []
+    assert memory.profile.atomic_calls == []
     assert result["rewritten_sections"] == []
 
 
 @pytest.mark.asyncio
-async def test_profile_rewrite_failure_does_not_block_other_sections():
-    """A raising replace_section (e.g. invalid section name from the LLM)
-    must be swallowed per-section — appends and the ok status still happen."""
+async def test_profile_apply_failure_fails_closed_without_ack_ids():
+    """Fail-closed: a raising atomic apply must fail the whole snapshot
+    with no acknowledgement IDs (no trim), not swallow per-section."""
     memory = FakeMemoryManager()
 
-    async def failing_replace_section(scope_id, section, bullets, expected_profile_hash=None):
-        raise ValueError(f"invalid section: {section!r}")
+    async def failing_apply(scope_id, rewrites, appends, expected_profile_hash=None):
+        raise ValueError("invalid section")
 
-    memory.profile.replace_section = failing_replace_section
+    memory.profile.apply_consolidation_updates = failing_apply
     tool = ConsolidateMemoryTool(
         memory_manager=memory,
         llm_service=FakeLLMWithRewrites(),
@@ -463,9 +474,5 @@ async def test_profile_rewrite_failure_does_not_block_other_sections():
         await tool.execute(scope="user", scope_id="u1", reason="x", entries=entries)
     )
 
-    assert result["status"] == "ok"
-    assert result["rewritten_sections"] == []
-    # Rewrite failed → the section falls back to the normal append path
-    # (bullet still recorded somewhere rather than silently lost).
-    appended_sections = {c[1] for c in memory.profile.append_raw_calls}
-    assert appended_sections == {"interest", "work"}
+    assert result["status"] == "failed"
+    assert not result.get("entry_ids")

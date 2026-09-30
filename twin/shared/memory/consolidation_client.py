@@ -18,8 +18,17 @@ class ConsolidationClient:
     This replaces the old local consolidation pipeline with A2A calls.
     """
 
-    def __init__(self, evernight_url: str, timeout: float = 300.0):
-        self.a2a_client = A2AClient(base_url=evernight_url, timeout=timeout)
+    def __init__(
+        self,
+        evernight_url: str,
+        timeout: float = 300.0,
+        *,
+        actor: str = "march7",
+        secret: str | None = None,
+    ):
+        self.a2a_client = A2AClient(
+            base_url=evernight_url, timeout=timeout, actor=actor, secret=secret
+        )
         logger.info("ConsolidationClient initialized for %s", evernight_url)
 
     @traceable(name="a2a.consolidate_scope", run_type="chain", tags=["a2a", "consolidation"])

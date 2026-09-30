@@ -1,33 +1,41 @@
 """Timeline summary storage — T2 memory layer (schema v3: diary model).
 
-TimelineSummaryStore orchestrates write (store_summary, same-day diary
+TimelineSummaryStore orchestrates writes (store_summary, same-day diary
 merge) and hybrid KNN+BM25 search over Redis Stack. Field encode/decode
-lives in codec.py, same-day merge in merge.py, and index
-DDL/introspection in schema.py.
+lives in codec.py, same-day merge in merge.py, index DDL/introspection
+in schema.py, read queries in reader.py, atomic commits in writer.py,
+and the cosine-gate policy in gates.py.
 """
 from __future__ import annotations
 
 import json
 import logging
-import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from twin.shared.config.settings import Config
-from twin.shared.llm.embedding.embedding_trace_logger import cosine_similarity
 from twin.shared.memory.diary.merge import try_diary_merge
 from twin.shared.memory.diary.codec import (
-    escape_tag_value,
     importance_to_ttl,
     pack_embedding,
-    parse_results,
 )
+from twin.shared.memory.diary.gates import (
+    gate_bm25_only_by_cosine,
+    gate_by_similarity,
+)
+from twin.shared.memory.diary.idempotency import (
+    marker_key as _idempotency_marker_key,
+)
+from twin.shared.memory.diary.idempotency import (
+    normalize_idempotency_key,
+)
+from twin.shared.memory.diary.reader import DiaryReader, time_filter_clause
 from twin.shared.memory.diary.schema import (
     create_timeline_index,
     ensure_diary_fields,
     extract_indexed_dim,
 )
+from twin.shared.memory.diary.writer import DiaryWriter
 from twin.shared.memory.vn_time import vn_day_str
 
 logger = logging.getLogger(__name__)
@@ -73,10 +81,9 @@ class TimelineSummary:
 
 
 class TimelineSummaryStore:
-    """Vector + BM25 store for timeline summaries (T2).
-
-    search() supports KNN-only or hybrid (KNN + BM25 fused via RRF)
-    depending on whether query_text is passed.
+    """Vector + BM25 store for timeline summaries (T2). Thin orchestrator:
+    reads -> DiaryReader, commits -> DiaryWriter, gating -> gates.py.
+    A detected index-dim mismatch fails closed (raise, HASHes untouched).
     """
 
     def __init__(
@@ -87,13 +94,26 @@ class TimelineSummaryStore:
     ):
         self.redis = redis_client
         self.embedding_dim = embedding_dim
-        # Only needed to re-embed merged text on a diary-merge write (P2.2).
-        # None disables merging entirely (falls back to pre-diary
-        # append-only behavior) — keeps every caller/test that constructs
-        # this store without one working unchanged.
+        # Only re-embeds merged text on diary-merge writes; None disables
+        # merging (append-only), keeping service-less callers working.
         self.embedding_service = embedding_service
         self.index_name = "timeline_summaries"
         self.prefix = "timeline:summary"
+        # Flipped False only when initialize() positively detects an index
+        # DIM mismatch; unknown (never initialized) stays usable.
+        self._index_usable = True
+        self._reader = DiaryReader(
+            redis_client, index_name=self.index_name, prefix=self.prefix,
+        )
+        self._writer = DiaryWriter(redis_client, prefix=self.prefix)
+
+    def _require_usable_index(self, op: str) -> None:
+        if not self._index_usable:
+            raise RuntimeError(
+                f"T2 {op} refused: timeline index DIM != embedding_dim="
+                f"{self.embedding_dim} (reindex required; index and HASHes "
+                "left untouched — this process will not drop or rewrite them)"
+            )
 
     # ---------------------------------------------------------------- init
 
@@ -111,11 +131,15 @@ class TimelineSummaryStore:
                     "(this will NOT auto-drop the index).",
                     self.index_name, indexed_dim, self.embedding_dim,
                 )
+                self._index_usable = False
+            else:
+                self._index_usable = True
             await ensure_diary_fields(self.redis, self.index_name, info)
         except Exception:
             await create_timeline_index(
                 self.redis, self.index_name, self.prefix, self.embedding_dim,
             )
+            self._index_usable = True
 
     # ---------------------------------------------------------------- write
 
@@ -131,25 +155,45 @@ class TimelineSummaryStore:
         period_start: float | None = None,
         period_end: float | None = None,
         source_entry_ids: list[str] | None = None,
+        idempotency_key: str | None = None,
     ) -> str:
         """Store a topic summary as a diary entry; return summary_id.
 
-        Same-day near-duplicates (cosine >= T2_MERGE_MIN_COSINE) merge into
-        the existing doc instead of appending (needs embedding_service).
-        Raises ValueError on embedding dim mismatch — storing anyway used to
-        silently fail RediSearch indexing, leaving the summary unsearchable.
+        Same-day near-duplicates (cosine >= T2_MERGE_MIN_COSINE, same
+        normalized topic) merge into the existing doc instead of appending
+        (needs embedding_service). ValueError on embedding dim mismatch —
+        storing anyway silently breaks RediSearch indexing.
+
+        idempotency_key (optional, #6): same-key retries return the
+        original summary_id. Marker commits atomically with HASH+TTL
+        under WATCH/CAS and is honored only while its HASH EXISTS;
+        needs a transactional Redis client, fails closed without one.
         """
+        self._require_usable_index("store_summary")
         if len(embedding) != self.embedding_dim:
             raise ValueError(
                 f"store_summary: embedding dim mismatch — got {len(embedding)}, "
                 f"expected {self.embedding_dim} (user={user_id})"
             )
+        idem = normalize_idempotency_key(idempotency_key)
 
         now_ts = datetime.now(timezone.utc).timestamp()
         ps = float(period_start) if period_start is not None else now_ts
         pe = float(period_end) if period_end is not None else ps
         day = vn_day_str(ps)
         entry_ids = [str(x) for x in (source_entry_ids or [])]
+
+        marker: str | None = None
+        if idem is not None:
+            if not self._writer.supports_transactions():
+                raise RuntimeError(
+                    "T2 idempotent store needs a transactional Redis client "
+                    "(pipeline/WATCH); refusing a non-atomic marker write"
+                )
+            marker = _idempotency_marker_key(user_id, topic, entry_ids, idem)
+            winner = await self._writer.verified_claim(marker)
+            if winner is not None:
+                return winner
 
         if self.embedding_service is not None:
             merged_id = await try_diary_merge(
@@ -162,6 +206,10 @@ class TimelineSummaryStore:
                 period_start=ps,
                 period_end=pe,
                 source_entry_ids=entry_ids,
+                topic=topic,
+                topic_display=topic_display,
+                marker_key=marker,
+                writer=self._writer,
             )
             if merged_id is not None:
                 return merged_id
@@ -176,7 +224,8 @@ class TimelineSummaryStore:
         )
 
         key = f"{self.prefix}:{entry.summary_id}"
-        await self.redis.hset(
+        ttl_seconds = importance_to_ttl(importance) * 86400
+        winner = await self._writer.append_doc(
             key,
             mapping={
                 "user_id":       user_id,
@@ -186,16 +235,20 @@ class TimelineSummaryStore:
                 "importance":    importance,
                 "created_at":    entry.created_at.timestamp(),
                 "version":       entry.version,
+                "merge_version": 0,
                 "day":           day,
                 "period_start":  ps,
                 "period_end":    pe,
                 "source_entry_ids": json.dumps(entry_ids, ensure_ascii=False),
                 "embedding":     pack_embedding(embedding),
             },
+            ttl_seconds=ttl_seconds,
+            marker_key=marker,
+            marker_value=entry.summary_id,
+            marker_ttl_seconds=ttl_seconds,
         )
-
-        ttl_days = importance_to_ttl(importance)
-        await self.redis.expire(key, ttl_days * 86400)
+        if winner is not None:
+            return winner
 
         logger.info(
             "Stored T2 summary %s topic=%s user=%s day=%s",
@@ -216,14 +269,11 @@ class TimelineSummaryStore:
         since_ts: float | None = None,
         until_ts: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Hybrid (KNN + BM25 RRF) or pure KNN search, filtered by user_id
-        and optional topic/time bounds. query_embedding is caller-composed
-        (query prefix + text); pass query_text to also run BM25 fused via
-        RRF.
+        """KNN-only, or hybrid (KNN + BM25 fused via RRF) with query_text.
+        query_embedding is caller-composed (query prefix + text).
         """
-        # Built conditionally (not passed as since_ts=None, until_ts=None)
-        # so unit tests that monkeypatch _search_knn/_search_bm25 with the
-        # pre-P3.2 4-positional-arg signature keep working unfiltered.
+        self._require_usable_index("search")
+        # Conditional so fakes with the pre-P3.2 4-arg signature keep working.
         time_kwargs: dict[str, float] = {}
         if since_ts is not None:
             time_kwargs["since_ts"] = since_ts
@@ -241,46 +291,28 @@ class TimelineSummaryStore:
             user_id, query_text, limit, topic_filter, **time_kwargs,
         )
 
-        # Fuse WITHOUT truncation, then gate, THEN apply the final limit. If we
-        # truncated to `limit` first, a gated doc ranked inside the fused top-N
-        # would consume a slot and then get stripped, so a valid doc ranked just
-        # below it is lost — under-returning even when enough valid docs exist.
+        # Fuse untruncated, then gate, THEN limit — truncating first would
+        # let a stripped gated doc evict a valid doc below the limit.
         fused = _rrf_fuse(
             knn_results, bm25_results, limit=len(knn_results) + len(bm25_results),
         )
 
-        # A doc the cosine gate would drop from KNN must not re-enter through
-        # BM25's ungated results. Compute the ids the gate rejects from the raw
-        # KNN hits and strip them from the fused output; BM25-only docs (never
-        # seen by KNN, so not in gated_ids) pass through untouched.
+        # Strip KNN-gated ids from the fused output so BM25 can't smuggle
+        # them back in; BM25-only docs pass through to the cosine check below.
         kept_ids = {d.get("summary_id") for d in self._gate_by_similarity(knn_results)}
         gated_ids = {d.get("summary_id") for d in knn_results} - kept_ids
         fused = [d for d in fused if d.get("summary_id") not in gated_ids]
 
-        # P3.5 (fix B3): a doc KNN never scored (BM25-only) has no cosine
-        # distance to gate on above, so it always passed fusion ungated —
-        # turning BM25 into a bypass of T2_MIN_COSINE. Compute its cosine in
-        # Python (its `embedding` field is present — no RETURN clause narrows
-        # BM25's fields) and apply the SAME floor, so BM25 is ranking-only.
+        # P3.5 (fix B3): score BM25-only docs in Python against the SAME
+        # floor (fail-closed on bad embeddings, #25) so BM25 is ranking-only.
         fused = self._gate_bm25_only_by_cosine(fused, knn_results, query_embedding)
 
         return fused[:limit]
 
     @staticmethod
     def _time_filter_clause(since_ts: float | None, until_ts: float | None) -> str | None:
-        """Build the RediSearch OR-fallback time filter clause (P3.2).
-
-        RediSearch has no COALESCE: a doc missing `period_end` (pre-v3) never
-        matches any range query on it, so `-@period_end:[-inf +inf]` isolates
-        those docs and re-tests them against `created_at` instead. None when
-        both bounds are unset.
-        """
-        if since_ts is None and until_ts is None:
-            return None
-        lo = since_ts if since_ts is not None else "-inf"
-        hi = until_ts if until_ts is not None else "+inf"
-        rng = f"[{lo} {hi}]"
-        return f"(@period_end:{rng} | (-@period_end:[-inf +inf] @created_at:{rng}))"
+        """RediSearch OR-fallback time filter; implementation lives in reader."""
+        return time_filter_clause(since_ts, until_ts)
 
     def _gate_bm25_only_by_cosine(
         self,
@@ -288,39 +320,7 @@ class TimelineSummaryStore:
         knn_results: list[dict[str, Any]],
         query_embedding: list[float],
     ) -> list[dict[str, Any]]:
-        """Apply the T2_MIN_COSINE floor to BM25-only docs (P3.5, fix B3).
-
-        No-op when the floor is 0.0. Docs already seen by KNN were gated
-        above; only docs reachable solely through BM25 are scored here. A
-        doc missing an embedding is kept (fail-open), not dropped.
-        """
-        min_cos = getattr(Config, "T2_MIN_COSINE", 0.0)
-        if min_cos <= 0.0:
-            return fused
-        knn_ids = {d.get("summary_id") for d in knn_results}
-        kept: list[dict[str, Any]] = []
-        for doc in fused:
-            sid = doc.get("summary_id")
-            if sid in knn_ids:
-                kept.append(doc)
-                continue
-            embedding = doc.get("embedding")
-            if not embedding or not query_embedding:
-                kept.append(doc)
-                continue
-            try:
-                similarity = cosine_similarity(query_embedding, embedding)
-            except ValueError:
-                kept.append(doc)
-                continue
-            if similarity >= min_cos:
-                kept.append(doc)
-            else:
-                logger.debug(
-                    "T2 gate (BM25-only): drop summary_id=%s cosine=%.3f < %.2f",
-                    sid, similarity, min_cos,
-                )
-        return kept
+        return gate_bm25_only_by_cosine(fused, knn_results, query_embedding)
 
     async def _search_knn(
         self,
@@ -332,58 +332,15 @@ class TimelineSummaryStore:
         since_ts: float | None = None,
         until_ts: float | None = None,
     ) -> list[dict[str, Any]]:
-        """KNN semantic search. Returns raw hits ungated — callers apply the
-        cosine gate (search() gates directly for pure-KNN, or post-fusion for
-        hybrid so BM25 can't smuggle a gated-out doc back in)."""
-        uid = escape_tag_value(user_id)
-        tag_filter = f"@user_id:{{{uid}}}"
-        if topic_filter:
-            tag_filter += f" @topic:{{{escape_tag_value(topic_filter)}}}"
-        time_clause = self._time_filter_clause(since_ts, until_ts)
-        filter_expr = f"{tag_filter} {time_clause}" if time_clause else tag_filter
-        query = f"({filter_expr})=>[KNN {limit} @embedding $vec AS score]"
-
-        try:
-            results = await self.redis.execute_command(
-                "FT.SEARCH", self.index_name,
-                query,
-                "PARAMS", "2", "vec", pack_embedding(query_embedding),
-                "SORTBY", "score", "ASC",
-                "LIMIT", "0", str(limit),
-                "DIALECT", "2",
-            )
-            return parse_results(results, self.prefix)
-        except Exception as exc:
-            logger.error("Timeline KNN search failed: %s", exc)
-            return []
+        return await self._reader.search_knn(
+            user_id, query_embedding, limit, topic_filter,
+            since_ts=since_ts, until_ts=until_ts,
+        )
 
     def _gate_by_similarity(
         self, results: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Drop KNN hits below the cosine-similarity floor.
-
-        score = 1 - cosine_similarity (COSINE index). Without this gate, a
-        near-empty or off-topic T2 store still injects top-K noise into
-        every prompt. No-op when the floor is 0.0 or a hit has no score.
-        """
-        min_cos = getattr(Config, "T2_MIN_COSINE", 0.0)
-        if min_cos <= 0.0:
-            return results
-        kept: list[dict[str, Any]] = []
-        for doc in results:
-            dist = doc.get("score")
-            if dist is None:
-                kept.append(doc)
-                continue
-            similarity = 1.0 - float(dist)
-            if similarity >= min_cos:
-                kept.append(doc)
-            else:
-                logger.debug(
-                    "T2 gate: drop summary_id=%s cosine=%.3f < %.2f",
-                    doc.get("summary_id"), similarity, min_cos,
-                )
-        return kept
+        return gate_by_similarity(results)
 
     async def _search_bm25(
         self,
@@ -395,43 +352,10 @@ class TimelineSummaryStore:
         since_ts: float | None = None,
         until_ts: float | None = None,
     ) -> list[dict[str, Any]]:
-        """BM25 full-text search on the 'summary' field."""
-        safe_text = re.sub(r"[^a-zA-Z0-9\sÀ-ɏẠ-ỹ]", " ", query_text).strip()
-        if not safe_text:
-            return []
-
-        # OR the terms: lexical recall wants "any keyword matches" (e.g. catch
-        # "Rei"/"AMD"), not "all words present". RediSearch ANDs space-separated
-        # terms by default, which would make BM25 almost never fire on natural
-        # queries — silently degrading hybrid back to KNN-only.
-        terms = [t for t in safe_text.split() if t]
-        if not terms:
-            return []
-        term_group = " | ".join(terms)
-
-        uid = escape_tag_value(user_id)
-        tag_filter = f"@user_id:{{{uid}}}"
-        if topic_filter:
-            tag_filter += f" @topic:{{{escape_tag_value(topic_filter)}}}"
-        time_clause = self._time_filter_clause(since_ts, until_ts)
-        if time_clause:
-            tag_filter += f" {time_clause}"
-
-        bm25_query = f"({tag_filter}) ({term_group})"
-
-        try:
-            results = await self.redis.execute_command(
-                "FT.SEARCH", self.index_name,
-                bm25_query,
-                "SCORER", "BM25",
-                "WITHSCORES",
-                "LIMIT", "0", str(limit),
-                "DIALECT", "2",
-            )
-            return parse_results(results, self.prefix, has_scores=True)
-        except Exception as exc:
-            logger.error("Timeline BM25 search failed: %s", exc)
-            return []
+        return await self._reader.search_bm25(
+            user_id, query_text, limit, topic_filter,
+            since_ts=since_ts, until_ts=until_ts,
+        )
 
     # ---------------------------------------------------------------- get_recent
 
@@ -443,30 +367,12 @@ class TimelineSummaryStore:
         since_ts: float | None = None,
         until_ts: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Get recent summaries sorted by created_at DESC.
-
-        since_ts/until_ts: optional epoch-second bounds on the diary period,
-        same OR-fallback semantics as search() — see _time_filter_clause.
-        """
-        tag_filter = f"@user_id:{{{escape_tag_value(user_id)}}}"
-        time_clause = self._time_filter_clause(since_ts, until_ts)
-        query = f"({tag_filter} {time_clause})" if time_clause else tag_filter
-        # DIALECT 2 only added when the OR/negation time_clause is actually in
-        # play (same construct _search_knn/_search_bm25 already rely on
-        # DIALECT 2 for) — the plain tag-only query keeps its exact prior args.
-        dialect_args = ["DIALECT", "2"] if time_clause else []
-        try:
-            results = await self.redis.execute_command(
-                "FT.SEARCH", self.index_name,
-                query,
-                "SORTBY", "created_at", "DESC",
-                "LIMIT", "0", str(limit),
-                *dialect_args,
-            )
-            return parse_results(results, self.prefix)
-        except Exception as exc:
-            logger.error("Timeline get_recent failed: %s", exc)
-            return []
+        """Recent summaries, newest content-time first (bounds behave as in
+        search(); see _time_filter_clause)."""
+        self._require_usable_index("get_recent")
+        return await self._reader.get_recent(
+            user_id, limit, since_ts=since_ts, until_ts=until_ts,
+        )
 
 
 # -------------------------------------------------------------------- RRF

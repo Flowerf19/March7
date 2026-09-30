@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,7 +37,9 @@ class FailingDMClient:
 
 
 class FakeResponse:
-    status = 200
+    def __init__(self, status: int = 200, payload: dict[str, Any] | None = None):
+        self.status = status
+        self._payload = payload or {"approved": True, "grant": "g", "reason": "approved"}
 
     async def __aenter__(self):
         return self
@@ -45,16 +48,20 @@ class FakeResponse:
         return False
 
     async def json(self):
-        return {"approved": True}
+        return dict(self._payload)
+
+    async def text(self):
+        return json.dumps(self._payload)
 
 
 class FakeSession:
-    def __init__(self) -> None:
+    def __init__(self, response: FakeResponse | None = None) -> None:
         self.posts: list[dict[str, Any]] = []
+        self._response = response or FakeResponse()
 
-    def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]):
-        self.posts.append({"url": url, "json": json, "headers": headers})
-        return FakeResponse()
+    def post(self, url: str, *, data: bytes, headers: dict[str, str]):
+        self.posts.append({"url": url, "data": data, "headers": headers})
+        return self._response
 
 
 @pytest.fixture(autouse=True)
@@ -71,6 +78,14 @@ async def test_approval_gate_rejects_without_context(monkeypatch):
     approved = await ApprovalGate().check_approval("host_system", "pwd")
 
     assert approved is False
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_never_auto_approves(monkeypatch):
+    # The legacy dev bypass is gone: fail closed even when explicitly enabled.
+    monkeypatch.setenv("APPROVAL_AUTO_APPROVE_WITHOUT_CONTEXT", "true")
+
+    assert await ApprovalGate().check_approval("host_system", "pwd") is False
 
 
 @pytest.mark.asyncio
@@ -113,7 +128,12 @@ async def test_approval_gate_falls_back_to_channel_backend_when_dm_fails():
 @pytest.mark.asyncio
 async def test_dm_client_request_approval_uses_neutral_context(monkeypatch):
     session = FakeSession()
-    client = DMClient(evernight_url="http://evernight.local")
+    client = DMClient(
+        evernight_url="http://evernight.local",
+        actor="march7",
+        secret="test-a2a-secret",
+        owner_user_id=123,
+    )
 
     async def fake_get_session():
         return session
@@ -136,17 +156,17 @@ async def test_dm_client_request_approval_uses_neutral_context(monkeypatch):
     )
 
     assert approved is True
-    assert session.posts == [
-        {
-            "url": "http://evernight.local/dm",
-            "json": {
-                "user_id": 123,
-                "command": "ls -la",
-                "channel_id": 456,
-                "message_id": 789,
-                "channel_name": "Guild/#ops",
-                "type": "approval",
-            },
-            "headers": {"Content-Type": "application/json"},
-        }
-    ]
+    assert len(session.posts) == 1
+    post = session.posts[0]
+    assert post["url"] == "http://evernight.local/dm"
+    body = json.loads(post["data"].decode("utf-8"))
+    assert body["user_id"] == 123
+    assert body["command"] == "ls -la"
+    assert body["channel_id"] == 456
+    assert body["message_id"] == 789
+    assert body["channel_name"] == "Guild/#ops"
+    assert body["type"] == "approval"
+    assert body["action"] == "shell"
+    assert post["headers"]["Content-Type"] == "application/json"
+    assert post["headers"]["X-A2A-Actor"] == "march7"
+    assert "X-A2A-Signature" in post["headers"]

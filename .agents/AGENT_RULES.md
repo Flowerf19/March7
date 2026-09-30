@@ -8,17 +8,26 @@ Rules for coding agents working in this repository.
   keys, or URLs containing credentials.
 - **System Gateway is the host boundary.** Use `host_system` for new host
   interactions. Do not add direct host shell calls from containers.
-- **System Gateway invariants:**
-  - Mutating requests must carry a valid HMAC-SHA256 signature from
-    `SYSTEM_GATEWAY_SHARED_SECRET`.
-  - Mutating actions and raw shell require an action-bound, actor-bound,
-    single-use approval token. Bare approval IDs or unconsumed tokens are not
-    enough.
+- **System Gateway invariants (Plan A, staged, no deployment has occurred):**
+  - Evernight owner DM/UI is the trusted issuer; March7 may request but cannot
+    sign approvals. Only the configured owner (`EVERNIGHT_OWNER_USER_ID`)
+    approves; non-owner requesters may trigger a request, never approve it.
+    Missing owner or missing approval key fails closed (deny, no fallback).
+  - Request-HMAC key `SYSTEM_GATEWAY_SHARED_SECRET` is DISTINCT from the
+    private approval key FILE. The approval value lives only in a host-private
+    FILE outside the repo, mounted read-only into Evernight alone
+    (`/run/secrets/system_gateway_approval`; March7 never mounts/reads it).
+    Equal credentials are rejected. Secrets stay out of shared `.env`/repo.
+  - Shell requires an owner-signed structured grant bound to the canonical
+    execution action (`canonical_approval_action`) + actor + expiry + durable
+    single use (SQLite ledger + nonce). Bare approval IDs or unconsumed tokens
+    are not enough; March7 passes the grant through, never mints.
+  - Native generic shell is the only execution path; no structured actions.
+    Raw shell is denied by default (`SYSTEM_GATEWAY_RAW_SHELL=false`); enabling
+    it requires explicit config and still requires an owner-signed grant.
   - Never bypass the gateway by having Evernight or March7 execute host
     commands through Redis, Docker socket, or any other side channel.
-  - Raw shell is denied by default; enabling it requires explicit config and
-    still requires owner approval.
-  - Do not log the shared secret or approval tokens.
+  - Do not log the shared secret, approval key, or grant tokens.
 - Keep the March7/Evernight A2A boundary intact. Evernight must not read or
   clear March7 T1 state by direct Redis key access.
 - Keep the gateway/platform boundary intact. Discord, Zalo, and future chat
@@ -34,9 +43,9 @@ Rules for coding agents working in this repository.
 - Make small, task-scoped changes. Avoid broad refactors, speculative abstractions, unrelated formatting, and new tooling unless requested.
 - If a change affects runtime flow, env vars, Docker, memory schema, or public
   behavior, update relevant docs in this folder and project READMEs.
-- If touching `gateway/`, first check
-  [plans/gateway-platform-abstraction.md](plans/gateway-platform-abstraction.md).
-  Until that plan is implemented, avoid adding new dependencies from
+- If touching `gateway/`, first read the current boundaries in
+  [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md); the earlier
+  `plans/gateway-platform-abstraction.md` is absent. Avoid adding dependencies from
   `twin/shared/*`, `twin/march7/*`, or gateway core files back into
   `gateway.adapters.discord`.
 
@@ -113,7 +122,7 @@ Update upstream: `cd ~/.claude/skills && git pull`.
 - The legacy local Python consolidation paths (including `DiscussionConsolidator`, `consolidate_t2_memory`, `Consolidator`, `CleanupScheduler`, `TimelineStore`, `TimelineSearch`, and `T2Memory`) were removed. Current flow uses **A2A Consolidation**: `InactivityTrigger` on Evernight detects idle scopes → March7 sends task via `ConsolidationClient` (A2A) with shipped T1 entries → Evernight runs `ConsolidateMemoryTool` using those shipped entries (it does not re-read March7's T1) and writes to `TimelineSummaryStore` / `MarkdownProfileStore`.
 - Each agent builds the shared stack (`ActiveMemory`, `MarkdownProfileStore`, `TimelineSummaryStore`) in its container. T2 RediSearch index must use Redis DB 0 (`TIMELINE_REDIS_DB=0`).
 - **`twin/shared/tools/` consolidated 2026-05-26.** Core types live in `twin.shared.tools.registry`; individual tool classes live under `twin/shared.tools.modules.<domain>.<tool>` (domains: `execution`, `memory`, `profile`, `web`). The paths `twin.shared.tools.base_tool` / `tool_registry` / `tool_discovery` / `implementations.system.*` no longer exist — do not recreate them.
-- **LLM/embedding endpoints chạy trên host phải dùng `host.docker.internal`, không phải `localhost`.** Container march7/evernight có `extra_hosts: host.docker.internal:host-gateway` trong compose; `localhost` trong `.env` sẽ trỏ vào chính container và fail với `Cannot connect to host localhost:<port>`. Áp dụng cho `OPENAI_API_URL`, `EMBEDDING_API_URL`, `LM_STUDIO_API_URL`, `TOOL_LLM_ENDPOINT`. Service nội-mạng Docker (redis, codebox, evernight) thì dùng service name.
+- **LLM/embedding endpoints chạy trên host phải dùng `host.docker.internal`, không phải `localhost`.** Container march7/evernight có `extra_hosts: host.docker.internal:host-gateway` trong compose; `localhost` trong `.env` sẽ trỏ vào chính container và fail với `Cannot connect to host localhost:<port>`. Áp dụng cho `OPENAI_API_URL`, `LM_STUDIO_API_URL`, `TOOL_LLM_ENDPOINT`. (Embeddings là Harrier ONNX local, không qua API.) Service nội-mạng Docker (redis, codebox, evernight) thì dùng service name.
 - **Docker entry for March7 is `python -m gateway`** (`gateway/__main__.py`),
   not `python -m twin.march7`. When wiring new background tasks (triggers,
   workers, schedulers) for March7, add them to `gateway/__main__.py` so they
@@ -125,22 +134,47 @@ Update upstream: `cd ~/.claude/skills && git pull`.
   `system-gateway` service. Do not recreate privileged container-side host
   bridges.
 - **System Gateway runs on the host, not in a container.** Containers reach it
-  via `SYSTEM_GATEWAY_URL` (e.g. `http://host.docker.internal:8380`). The
-  secret is shared through `SYSTEM_GATEWAY_SHARED_SECRET`.
+  via `SYSTEM_GATEWAY_URL` (e.g. `http://host.docker.internal:8380`). Request
+  signing uses `SYSTEM_GATEWAY_SHARED_SECRET`; the separate approval key is a
+  host-private FILE mounted read-only into Evernight only. Source binds
+  (`twin/`, `gateway/`, `models/`) are read-only; only the agent's OWN persona
+  dir is a writable data-only overlay. Owner-absent boot yields `None` and
+  denies approval/DM without crashing.
 - **T2 recall is tool-only.** `SharedMemoryManager.get_context` returns only
   T1 + T3 context and no longer embeds or searches T2. The model obtains
-  timeline context by calling `search_memory`.
-- **T2 index dimension is 1024, not 768.** T2 uses `qwen3-embedding:0.6b`
-  (`EMBEDDING_MODEL_NAME`) with `VECTOR HNSW FLOAT32 COSINE DIM=1024`
-  (`EMBEDDING_VECTOR_SIZE`). Only dimension or index-type changes require
-  `FT.DROPINDEX timeline_summaries` and a restart; adding `day`,
-  `period_start`, and `period_end` is done via `FT.ALTER` without reindex.
-- **New T2/T1 env vars control current behavior:** `EMBEDDING_MODEL_NAME`,
-  `EMBEDDING_VECTOR_SIZE`, `EMBEDDING_QUERY_PREFIX`,
-  `EMBEDDING_PASSAGE_PREFIX`, `T2_MIN_COSINE` (default `0.0`; calibrated/deployed
-  `0.35`), `T2_MERGE_MIN_COSINE` (default `0.60`), `T2_MERGE_MAX_CHARS`
+  timeline context by calling `search_memory` (`user_id`, optional `channel_id`
+  dual-scope, optional `query`/`days_back`, `limit`). No peer reads another
+  agent's T1 by direct Redis access; consolidation ships entries over A2A and
+  trims only on a fully successful acknowledgement with exact `entry_ids` and
+  zero failed required writes — no trim on incomplete writes. T1 observe/trim
+  are Redis-atomic (Lua) with bounded trigger dispatch; diary vectors validate
+  dim/finite and fail closed (BM25-only invalid vectors are dropped, never
+  bypass); diary merge is CAS with recompute on conflict; profile writes are
+  CAS on `expected_profile_hash` with recompute-on-drift. Pending caller/receiver
+  journals and plans have no expiry; never erase receiver witnesses on caller
+  reset or a reported zero-store failure. Guarded trim validates nonce/snapshot
+  and journals `trimmed` in one OwnT1 EVAL. Only matching-generation release
+  follows; audited recovery requirements are in `ARCHITECTURE.md` §3.
+- **T2 index dimension is 640 (Harrier q4 ONNX only).** T2 uses local Harrier q4
+  with `VECTOR HNSW FLOAT32 COSINE DIM=640` (`EMBEDDING_VECTOR_SIZE`).
+  Dimension change uses `scripts/migrate_t2_harrier.py` dry-run + verified
+  backup + resumable re-embed from source HASH `summary` (dry-run by default
+  without `--apply`/`--rollback`; parser has no `--dry-run` flag;
+  `--apply` requires `--backup PATH`; `--recreate-index` only after validation
+  with `DROPINDEX` without `DD`; `--rollback --backup PATH`). Only the
+  `embedding` field is rewritten; never `DEL`/`UNLINK`/`FLUSHALL`/`DD`, never
+  pad/truncate legacy 1024 vectors. Backup before explicit migration; production
+  migration/redeploy is a manual owner action; no production data deletion.
+  Adding `day`, `period_start`, and `period_end` is done via `FT.ALTER` without
+  reindex.
+- **New T2/T1 env vars control current behavior:** `HARRIER_MODEL_DIR`,
+  `EMBEDDING_VECTOR_SIZE` (`640`), `EMBEDDING_QUERY_PREFIX`,
+  `EMBEDDING_PASSAGE_PREFIX`, `T2_MIN_COSINE` (default `0.60`),
+  `T2_MERGE_MIN_COSINE` (default `0.75`), `T2_MERGE_MAX_CHARS`
   (default `1500`), `T1_ARCHIVE_ENABLED` (default `true`),
-  `T1_ARCHIVE_TTL_DAYS` (default `90`).
+  `T1_ARCHIVE_TTL_DAYS` (default `90`). Legacy Qwen-era `0.0`/`0.35` retrieve
+  and `0.60` merge cause proven Harrier false positives; below-default explicit
+  overrides warn at import but are respected.
 - **`search_memory` is the only supported T2 retrieval tool.** It accepts
   `user_id`, optional `channel_id` (dual-scope), optional `query`, optional
   `days_back`, and `limit`. It does not accept `mode`, `topic`, `hours`, or

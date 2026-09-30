@@ -19,6 +19,7 @@ from twin.shared.memory.active.constants import (
 from twin.shared.memory.active.detector import FastPathDetector
 from twin.shared.memory.active.models import ActiveEntry
 from twin.shared.memory.active.store import ActiveStore
+from twin.shared.memory.consolidation_journal import discard_caller_pending
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +77,8 @@ class ActiveMemory:
             content=content,
             tokens=tokens,
         )
-        await self.store.save(entry)
-
-        new_total = await self.store.increment_tokens(
-            scope, scope_id, tokens, last_entry_ts=entry.created_at.timestamp()
-        )
+        # Single Lua: entry+index+tokens+last_ts linearize on Redis.
+        new_total = await self.store.observe_entry(entry)
 
         if role == "user":
             hit = self.detector.is_critical(content)
@@ -149,6 +147,16 @@ class ActiveMemory:
     ) -> list[ActiveEntry]:
         return await self.store.list_entries(scope, scope_id, limit=limit)
 
+    async def get_entries_by_ids(
+        self, scope: str, scope_id: str, entry_ids: list[str]
+    ) -> list[ActiveEntry]:
+        return await self.store.get_entries_by_ids(scope, scope_id, entry_ids)
+
+    async def list_unsummarized_entries(
+        self, scope: str, scope_id: str, *, limit: int = 200
+    ) -> list[ActiveEntry]:
+        return await self.store.list_unsummarized_entries(scope, scope_id, limit=limit)
+
     async def trim(
         self,
         scope: str,
@@ -160,58 +168,62 @@ class ActiveMemory:
         if not summarized_entry_ids:
             return
         all_entries = await self.store.list_entries(scope, scope_id, limit=10_000)
-        if not all_entries:
-            return
-        # Keep the N most recent entries no matter what.
+        # Keep the N most recent entries no matter what (Lua re-applies this
+        # authoritatively; the Python copy is only for best-effort archive).
         keep_ids = {e.entry_id for e in all_entries[-keep_recent:]} if keep_recent > 0 else set()
-        to_delete = [eid for eid in summarized_entry_ids if eid not in keep_ids]
-        if to_delete:
-            # W3: park the raw entries in a cold archive before deleting —
-            # T2 keeps only summaries, so this is the last copy of the
-            # verbatim transcript. Best-effort: an archive failure must
-            # never block the trim (the entries WERE summarized; blocking
-            # would re-summarize them forever).
-            if getattr(Config, "T1_ARCHIVE_ENABLED", True):
-                delete_set = set(to_delete)
-                entries_to_archive = [
-                    e for e in all_entries if e.entry_id in delete_set
-                ]
-                try:
-                    ttl_days = int(getattr(Config, "T1_ARCHIVE_TTL_DAYS", 90))
-                    await self.store.archive_entries(
-                        scope, scope_id, entries_to_archive,
-                        ttl_seconds=ttl_days * 86400,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "T1: archive-on-trim failed scope=%s/%s entries=%d — trimming anyway: %s",
-                        scope, scope_id, len(entries_to_archive), exc,
-                    )
-            await self.store.delete_entries(scope, scope_id, to_delete)
-
-        remaining = [e for e in all_entries if e.entry_id not in set(to_delete)]
-        # Count only tokens that are genuinely UN-summarized: exclude entries we
-        # just summarized but physically retained for context (the keep_recent
-        # tail). Entries that arrived after the consolidation snapshot are not in
-        # summarized_entry_ids, so they still count — keeping the scope hot until
-        # they too get summarized.
-        summarized_set = set(summarized_entry_ids)
-        remaining_tokens = sum(
-            e.tokens for e in remaining if e.entry_id not in summarized_set
-        )
-        await self.store.update_state(
-            scope, scope_id, unsummarized_tokens=remaining_tokens
+        by_id = {e.entry_id: e for e in all_entries}
+        seen: set[str] = set()
+        cand: list[str] = []
+        for eid in summarized_entry_ids:
+            if eid in seen:
+                continue
+            seen.add(eid)
+            if eid not in keep_ids:
+                cand.append(eid)
+        # W3: park raw entries in cold archive before deleting. Best-effort and
+        # never blocks trim; fetch beyond-10k IDs directly for completeness.
+        if cand and getattr(Config, "T1_ARCHIVE_ENABLED", True):
+            to_archive = []
+            for eid in cand:
+                ent = by_id.get(eid)
+                if ent is None:
+                    try:
+                        ent = await self.store.get_entry(scope, scope_id, eid)
+                    except Exception:
+                        ent = None
+                if ent is not None:
+                    to_archive.append(ent)
+            try:
+                ttl_days = int(getattr(Config, "T1_ARCHIVE_TTL_DAYS", 90))
+                await self.store.archive_entries(
+                    scope, scope_id, to_archive, ttl_seconds=ttl_days * 86400,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "T1: archive-on-trim failed scope=%s/%s entries=%d -- trimming anyway: %s",
+                    scope, scope_id, len(to_archive), exc,
+                )
+        # Single Lua: delete outside keep, mark retained, decrement once.
+        # Concurrent observes linearize before/after; never overwritten.
+        res = await self.store.trim_summarized(
+            scope, scope_id, summarized_entry_ids, keep_recent=keep_recent,
         )
         logger.info(
             "T1: trim scope=%s/%s deleted=%d remaining_tokens=%d",
-            scope,
-            scope_id,
-            len(to_delete),
-            remaining_tokens,
+            scope, scope_id, len(res["deleted_ids"]), int(res["unsummarized_tokens"]),
         )
+
+    async def trim_consolidated_batch(self, scope: str, scope_id: str, record: dict, *, keep_recent: int = KEEP_RECENT_MESSAGES_AFTER_SUMMARY) -> dict:
+        """Guarded consolidation trim: snapshots + single-EVAL trim+trimmed."""
+        from twin.shared.memory.active.consolidation_trim import guarded_trim_batch
+
+        return await guarded_trim_batch(self.store, scope, scope_id, record, int(keep_recent))
 
     async def reset_scope(self, scope: str, scope_id: str) -> None:
         await self.store.clear_scope(scope, scope_id)
+        # Own pending batch is unrecoverable once T1 is cleared; receiver
+        # witnesses stay (T2 partials may persist) — see journal docstring.
+        await discard_caller_pending(self.store.redis, scope, scope_id)
         logger.info("T1: reset scope=%s/%s", scope, scope_id)
 
     async def push_catalog(

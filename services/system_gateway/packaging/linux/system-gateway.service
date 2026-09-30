@@ -12,6 +12,8 @@ Environment=SYSTEM_GATEWAY_HOST=127.0.0.1
 Environment=SYSTEM_GATEWAY_PORT=8380
 # Load shared secret from a file with owner-only permissions.
 Environment=SYSTEM_GATEWAY_SHARED_SECRET_FILE=/etc/system-gateway/secret
+# Separate owner approval key (Evernight/owner CLI only); never in repo .env.
+Environment=SYSTEM_GATEWAY_APPROVAL_SECRET_FILE=/etc/system-gateway/approval_secret
 
 # Security hardening
 NoNewPrivileges=true

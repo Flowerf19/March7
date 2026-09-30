@@ -32,11 +32,15 @@ async def main():
 
     # Background poller that drives SummaryPolicy for both user and channel scopes
     trigger = None
-    if container.state_repo is not None and container.summary_policy is not None:
+    # March7Container exposes no state_repo/summary_policy (unlike Evernight):
+    # getattr keeps the trigger dormant instead of crashing startup.
+    state_repo = getattr(container, "state_repo", None)
+    summary_policy = getattr(container, "summary_policy", None)
+    if state_repo is not None and summary_policy is not None:
         poll_interval = int(getattr(config, "poll_interval", 60))
         trigger = InactivityTrigger(
-            state_repo=container.state_repo,
-            summary_policy=container.summary_policy,
+            state_repo=state_repo,
+            summary_policy=summary_policy,
             scopes=("user", "channel"),
             poll_interval=poll_interval,
         )

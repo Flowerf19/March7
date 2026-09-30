@@ -2,16 +2,38 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
-from twin.shared.tools.approval_context import ApprovalRequestContext
+from twin.shared.config.settings import Config
+from twin.shared.tools.approval_context import (
+    ApprovalRequestContext,
+    build_owner_approval_message,
+)
 
 if TYPE_CHECKING:
     import discord
 
+logger = logging.getLogger(__name__)
+
 
 class DiscordApprovalBackend:
-    """Render channel approval through Discord buttons."""
+    """Render channel approval through owner-bound Discord buttons.
+
+    Only the configured owner's click counts; the requester may be anyone.
+    The full command is shown -- never truncated -- and payloads that cannot
+    be displayed unambiguously within Discord bounds are denied.
+    """
+
+    def __init__(self, owner_user_id: str | int | None = None):
+        self._owner_user_id = (
+            str(owner_user_id).strip() if owner_user_id not in (None, "") else ""
+        )
+
+    def _resolve_owner(self) -> str:
+        if self._owner_user_id:
+            return self._owner_user_id
+        return str(getattr(Config, "EVERNIGHT_OWNER_USER_ID", "") or "").strip()
 
     async def request_channel_approval(
         self,
@@ -20,17 +42,26 @@ class DiscordApprovalBackend:
     ) -> bool:
         from gateway.adapters.discord.views.approve_view import ApproveView
 
+        owner = self._resolve_owner()
+        if not owner:
+            logger.warning("Channel approval denied: owner is not configured")
+            return False
+
         message = context.native_message
         if message is None or not hasattr(message, "channel"):
             return False
 
-        view = ApproveView(command=command)
-        sent_msg = await message.channel.send(
-            f"🔐 **Bot muốn chạy lệnh trên host:**\n"
-            f"```bash\n{command[:500]}\n```\n"
-            f"Cho phép? (Timeout: 30 giây)",
-            view=view,
+        prompt, reason = build_owner_approval_message(
+            str(command or ""),
+            channel_name=context.channel_name,
+            timeout_seconds=30,
         )
+        if prompt is None:
+            logger.warning("Channel approval denied: %s", reason)
+            return False
+
+        view = ApproveView(command=str(command or ""), owner_user_id=owner)
+        sent_msg = await message.channel.send(prompt, view=view)
 
         try:
             return await view.wait_for_decision()

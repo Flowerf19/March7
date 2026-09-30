@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 ERROR_MESSAGE = "Hệ thống não bộ của tớ đang bị quá tải xíu, cậu thử lại sau vài giây nhé!"
 EVERNIGHT_PREFIX = "!9"
-DEFAULT_OWNER_USER_ID = "726302130318868500"
+# No hardcoded owner fallback: empty/unknown owner fails closed (deny all).
 
 
 class _EvernightAgentRouter:
@@ -49,6 +49,8 @@ class _EvernightAgentRouter:
         agent_name: str,
         user_id: str,
         content: str,
+        *,
+        observe_input: bool = True,
         **_: object,
     ) -> str:
         if agent_name != "evernight":
@@ -59,6 +61,7 @@ class _EvernightAgentRouter:
             self.evernight.handle_chat,
             user_id=user_id,
             content=content,
+            observe_input=observe_input,
             langsmith_extra=langsmith_extra(
                 tags=["evernight", "discord", "chat"],
                 metadata={
@@ -87,11 +90,10 @@ class EvernightDiscordAdapter:
         self._token = token
         self._agent = agent
         self._client_id = client_id
-        self._owner_user_id = str(
-            owner_user_id
-            or os.getenv("EVERNIGHT_OWNER_USER_ID")
-            or DEFAULT_OWNER_USER_ID
-        )
+        # Explicit configured owner only; empty means unknown -> deny all.
+        explicit = str(owner_user_id or "").strip()
+        configured = os.getenv("EVERNIGHT_OWNER_USER_ID", "").strip()
+        self._owner_user_id = explicit or configured or ""
         self._handler = handler or GatewayChatHandler(
             agent_router=_EvernightAgentRouter(agent)
         )
@@ -126,11 +128,15 @@ class EvernightDiscordAdapter:
 
     async def _on_message(self, message: discord.Message):
         """Handle incoming Discord messages for Evernight — owner only."""
+        if message.author.bot:
+            return
         content = message.content.strip()
         if not content:
             return
 
-        # Owner-only check
+        # Owner-only check; unknown owner denies everyone (fail closed).
+        if not self._owner_user_id:
+            return
         if str(message.author.id) != self._owner_user_id:
             return
 
@@ -182,7 +188,7 @@ class EvernightDiscordAdapter:
                     "is_addressed": True,
                     "is_mentioned": is_mentioned,
                     "should_respond": True,
-                    "observe": False,
+                    "observe": True,
                     "allow_silence": False,
                     "respond_mode": "respond",
                     "conversation_id": str(message.channel.id) if message.guild else None,

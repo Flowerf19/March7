@@ -5,8 +5,13 @@ import logging
 from typing import Any, Callable
 
 from twin.shared.memory.active import ActiveEntry, ActiveMemory
+from twin.shared.memory.consolidation_coordinator import (
+    ConsolidationCoordinator,
+    entry_to_snapshot,
+    normalize_role,
+)
 from twin.shared.memory.profile import MarkdownProfileStore
-from twin.shared.observability.langsmith import add_current_run_metadata, traceable
+from twin.shared.observability.langsmith import traceable
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +36,13 @@ class SharedMemoryManager:
         self.embedding_service = embedding_service
         self.consolidation_client = consolidation_client
         self.local_consolidator = local_consolidator
+        self._coordinator = ConsolidationCoordinator(
+            self.t1,
+            lambda: self.consolidation_client,
+            lambda: self.local_consolidator,
+            get_caller_redis=lambda: getattr(getattr(self.t1, "store", None), "redis", None),
+            get_receiver_redis=lambda: getattr(self.timeline_summary_store, "redis", None),
+        )
 
     # ------------------------------------------------------------------ writes
 
@@ -173,79 +185,8 @@ class SharedMemoryManager:
         scope_id: str,
         entries: list[dict] | None = None,
     ) -> dict:
-        """Consolidate T1 messages, then trim on success.
-
-        Uses the remote A2A client if configured (March7 → Evernight), else a
-        local consolidator if set (Evernight worker), else fails.
-
-        On the A2A path the caller's OWN T1 entries are shipped over the wire so
-        Evernight consolidates this agent's messages (not its own T1, which is
-        empty for this agent's scopes). ``entries`` may be supplied directly by a
-        payload that already carries them; otherwise we read them here.
-        """
-        if self.consolidation_client is not None:
-            if entries is None:
-                t1_entries = await self.t1.get_context(scope, scope_id, limit=200)
-                entries = [self._entry_to_snapshot(e) for e in t1_entries]
-            logger.info(
-                "Consolidating via A2A client scope=%s/%s entries=%d",
-                scope, scope_id, len(entries),
-            )
-            result_dict = await self.consolidation_client.consolidate_scope(
-                scope=scope,
-                scope_id=scope_id,
-                reason="auto",
-                entries=entries,
-            )
-        elif self.local_consolidator is not None:
-            logger.info(
-                "Consolidating locally scope=%s/%s", scope, scope_id,
-            )
-            result_dict = await self.local_consolidator(
-                scope=scope,
-                scope_id=scope_id,
-                reason="auto",
-                entries=entries,
-            )
-        else:
-            logger.error("No consolidator configured (neither client nor local)")
-            add_current_run_metadata({
-                "entries_shipped": len(entries or []),
-                "trimmed": 0,
-                "trim_skipped_reason": "no_consolidator_configured",
-            })
-            return {"status": "failed", "scope": scope, "scope_id": scope_id, "error": "consolidator not configured"}
-
-        # Trim T1 by the EXACT entry_ids the consolidator summarized. Trimming by
-        # count (the old path) could delete entries that were never summarized —
-        # a remote agent's own T1, or messages that raced in mid-consolidation.
-        # If no entry_ids came back, skip trimming rather than risk data loss.
-        trimmed = 0
-        trim_skipped_reason: str | None = None
-        if result_dict.get("status") == "ok":
-            entry_ids = result_dict.get("entry_ids")
-            if entry_ids:
-                await self.t1.trim(scope, scope_id, entry_ids)
-                trimmed = len(entry_ids)
-                logger.info(
-                    "Trimmed T1 after consolidation: %d entries", trimmed,
-                )
-            else:
-                trim_skipped_reason = "no_entry_ids"
-                logger.warning(
-                    "Consolidation ok but no entry_ids returned scope=%s/%s — "
-                    "skipping trim to avoid deleting un-summarized entries",
-                    scope, scope_id,
-                )
-        else:
-            trim_skipped_reason = f"status_{result_dict.get('status')}"
-
-        add_current_run_metadata({
-            "entries_shipped": len(entries or []),
-            "trimmed": trimmed,
-            "trim_skipped_reason": trim_skipped_reason,
-        })
-        return result_dict
+        """Consolidate T1 messages, then trim on validated acknowledgement."""
+        return await self._coordinator.consolidate_scope(scope, scope_id, entries)
 
     async def consolidate_snapshot(
         self,
@@ -253,23 +194,9 @@ class SharedMemoryManager:
         snapshot: list[dict],
         reason: str = "manual",
     ) -> bool:
-        del reason
-        for item in snapshot or []:
-            role = self._normalize_role(str(item.get("role") or "user"))
-            content = str(item.get("content") or "")
-            if not content.strip():
-                continue
-            await self.t1.observe(
-                "user",
-                str(user_id),
-                role,
-                content,
-                author_id=str(user_id) if role == "user" else None,
-                author_name=str(user_id) if role == "user" else None,
-                message_id=str(item.get("message_id") or item.get("id") or "") or None,
-            )
-        result = await self.consolidate_scope("user", str(user_id))
-        return result.get("status") in {"ok", "skipped"}
+        return await self._coordinator.consolidate_snapshot(
+            user_id, snapshot, reason=reason,
+        )
 
     # ---------------------------------------------------------------- helpers
 
@@ -325,11 +252,7 @@ class SharedMemoryManager:
 
     @staticmethod
     def _normalize_role(role: str) -> str:
-        if role == "assistant":
-            return "assistant"
-        if role == "system":
-            return "system"
-        return "user"
+        return normalize_role(role)
 
     @staticmethod
     def _entries_to_messages(entries: list[ActiveEntry]) -> list[dict]:
@@ -369,12 +292,4 @@ class SharedMemoryManager:
 
     @staticmethod
     def _entry_to_snapshot(entry: ActiveEntry) -> dict:
-        return {
-            "entry_id": entry.entry_id,
-            "message_id": entry.message_id,
-            "role": entry.role,
-            "content": entry.content,
-            "author_id": entry.author_id,
-            "author_name": entry.author_name,
-            "timestamp": entry.created_at.isoformat(),
-        }
+        return entry_to_snapshot(entry)

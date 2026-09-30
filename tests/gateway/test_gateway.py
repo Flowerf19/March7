@@ -192,3 +192,83 @@ class TestChatGateway:
 
         await gateway.stop_all()
         assert not gateway.is_healthy
+
+
+class FlakyAdapter(MockAdapter):
+    """Fails the first *failures* connects with a transient error."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self._failures = failures
+        self.connect_calls = 0
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+        if self._failures > 0:
+            self._failures -= 1
+            raise ConnectionError("transient boom")
+        self._connected = True
+
+
+class TestReconnectSupervision:
+    @pytest.fixture
+    def gateway(self) -> ChatGateway:
+        return ChatGateway(MockHandler())
+
+    @pytest.mark.asyncio
+    async def test_delayed_reconnect_then_stop_stays_disconnected(
+        self, gateway: ChatGateway, monkeypatch
+    ):
+        monkeypatch.setattr("gateway.gateway.RECONNECT_BASE_DELAY", 0.01)
+        adapter = FlakyAdapter(failures=1)
+        gateway.register_adapter("flaky", adapter)
+
+        await gateway.start_all()
+        assert not adapter.is_connected
+        assert adapter.connect_calls == 1
+
+        await gateway.stop_all()
+        await asyncio.sleep(0.1)
+
+        assert not adapter.is_connected
+        assert adapter.connect_calls == 1
+        assert gateway._reconnect_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_unregister_cancels_pending_reconnect(
+        self, gateway: ChatGateway, monkeypatch
+    ):
+        monkeypatch.setattr("gateway.gateway.RECONNECT_BASE_DELAY", 0.01)
+        adapter = FlakyAdapter(failures=10)
+        gateway.register_adapter("flaky", adapter)
+
+        await gateway.start_all()
+        assert adapter.connect_calls == 1
+
+        gateway.unregister_adapter("flaky")
+        await asyncio.sleep(0.1)
+
+        assert adapter.connect_calls == 1
+        assert not adapter.is_connected
+        assert gateway._reconnect_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_successful_reconnect_clears_tracking(
+        self, gateway: ChatGateway, monkeypatch
+    ):
+        monkeypatch.setattr("gateway.gateway.RECONNECT_BASE_DELAY", 0.01)
+        adapter = FlakyAdapter(failures=1)
+        gateway.register_adapter("flaky", adapter)
+
+        await gateway.start_all()
+        for _ in range(100):
+            if adapter.is_connected:
+                break
+            await asyncio.sleep(0.01)
+
+        assert adapter.is_connected
+        assert adapter.connect_calls == 2
+        assert gateway._reconnect_tasks == {}
+
+        await gateway.stop_all()
+        assert not adapter.is_connected

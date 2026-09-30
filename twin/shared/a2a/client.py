@@ -5,20 +5,47 @@ import json
 import logging
 import uuid
 from typing import AsyncIterator, Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 
+from twin.shared.a2a.auth import A2AAuthError, make_a2a_headers
+from twin.shared.a2a.sse import A2AStreamError, SseParser
 from twin.shared.a2a.types import A2AMessage, A2ATask, AgentCard, Part, TaskStatus
+from twin.shared.config.settings import Config
 from twin.shared.observability import a2a_parent_headers
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["A2AClient", "A2AStreamError"]
+
 
 class A2AClient:
-    def __init__(self, base_url: str, timeout: float = 300.0):
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 300.0,
+        *,
+        actor: str,
+        secret: str | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.actor = actor
+        self._secret = secret
         self._session: Optional[aiohttp.ClientSession] = None
+
+    def _resolve_secret(self) -> str:
+        resolved = self._secret or Config.A2A_SHARED_SECRET
+        if not resolved:
+            raise A2AAuthError("missing A2A shared secret")
+        return resolved
+
+    def _signed_headers(self, method: str, url: str, body: bytes) -> dict[str, str]:
+        path = urlsplit(url).path or "/"
+        return make_a2a_headers(
+            self.actor, method, path, body, secret=self._resolve_secret()
+        )
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -53,10 +80,16 @@ class A2AClient:
             "params": params,
             "id": str(uuid.uuid4()),
         }
+        url = f"{self.base_url}/"
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         async with session.post(
-            f"{self.base_url}/",
-            json=payload,
-            headers={"Content-Type": "application/json", **trace_headers},
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                **trace_headers,
+                **self._signed_headers("POST", url, body),
+            },
         ) as resp:
             data = await resp.json()
             if "result" in data:
@@ -72,11 +105,17 @@ class A2AClient:
             "params": {"id": task_id},
             "id": str(uuid.uuid4()),
         }
+        url = f"{self.base_url}/"
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         try:
             async with session.post(
-                f"{self.base_url}/",
-                json=payload,
-                headers={"Content-Type": "application/json", **trace_headers},
+                url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    **trace_headers,
+                    **self._signed_headers("POST", url, body),
+                },
             ) as resp:
                 data = await resp.json()
                 if "result" in data:
@@ -86,29 +125,61 @@ class A2AClient:
             logger.error("Failed to get task %s from %s: %s", task_id, self.base_url, e)
             return None
 
+    async def cancel_task(self, task_id: str) -> Optional[A2ATask]:
+        session = await self._get_session()
+        trace_headers = a2a_parent_headers()
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "tasks/cancel",
+            "params": {"id": task_id},
+            "id": str(uuid.uuid4()),
+        }
+        url = f"{self.base_url}/"
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        try:
+            async with session.post(
+                url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    **trace_headers,
+                    **self._signed_headers("POST", url, body),
+                },
+            ) as resp:
+                data = await resp.json()
+                if "result" in data:
+                    return self._parse_task(data["result"])
+                return None
+        except Exception as e:
+            logger.error("Failed to cancel task %s on %s: %s", task_id, self.base_url, e)
+            return None
+
     async def subscribe_stream(self, task_id: str) -> AsyncIterator[A2AMessage]:
         session = await self._get_session()
         trace_headers = a2a_parent_headers()
+        url = f"{self.base_url}/tasks/{task_id}/stream"
         async with session.get(
-            f"{self.base_url}/tasks/{task_id}/stream",
-            headers={"Accept": "text/event-stream", **trace_headers},
+            url,
+            headers={
+                "Accept": "text/event-stream",
+                **trace_headers,
+                **self._signed_headers("GET", url, b""),
+            },
             timeout=aiohttp.ClientTimeout(total=self.timeout, sock_read=self.timeout),
         ) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Stream error: {resp.status}")
 
-            buffer = ""
+            parser = SseParser()
             async for chunk in resp.content.iter_chunked(1024):
-                buffer += chunk.decode("utf-8")
-                while "\n\n" in buffer:
-                    event_str, buffer = buffer.split("\n\n", 1)
-                    for line in event_str.split("\n"):
-                        if not line.startswith("data: "):
-                            continue
-                        try:
-                            yield self._parse_message(json.loads(line[6:]))
-                        except json.JSONDecodeError:
-                            continue
+                for payload in parser.feed(chunk):
+                    try:
+                        yield self._parse_message(payload)
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise A2AStreamError(
+                            f"A2A stream truncated: invalid message ({exc})"
+                        ) from exc
+            parser.finish()
 
     async def send_task_and_wait(self, params: dict) -> list[A2AMessage]:
         if "id" not in params:
@@ -120,10 +191,16 @@ class A2AClient:
             messages.append(message)
 
         final_task = await self.get_task(task.id)
-        if final_task and final_task.status == TaskStatus.FAILED:
+        if final_task is None:
+            raise RuntimeError(f"A2A task status unknown: {task.id}")
+        if final_task.status == TaskStatus.FAILED:
             raise RuntimeError(self._last_text(messages) or f"A2A task failed: {task.id}")
-        if final_task and final_task.status == TaskStatus.CANCELLED:
+        if final_task.status == TaskStatus.CANCELLED:
             raise RuntimeError(f"A2A task cancelled: {task.id}")
+        if final_task.status != TaskStatus.COMPLETED:
+            raise RuntimeError(
+                f"A2A task incomplete: {task.id} status={final_task.status.value}"
+            )
         return messages
 
     async def send_text_task(

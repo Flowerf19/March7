@@ -7,8 +7,7 @@ from .llm_response import LLMResponse
 def __getattr__(name):
     _imports = {
         "BaseEmbeddingService": ".embedding",
-        "OpenAIEmbeddingService": ".embedding",
-        "GeminiEmbeddingService": ".embedding",
+        "HarrierEmbeddingService": ".embedding",
         "create_embedding_service": ".embedding",
         "GeminiService": ".gemini_service",
         "OpenAIService": ".openai_service",
@@ -23,8 +22,7 @@ def __getattr__(name):
 __all__ = [
     "BaseLLMService",
     "BaseEmbeddingService",
-    "OpenAIEmbeddingService",
-    "GeminiEmbeddingService",
+    "HarrierEmbeddingService",
     "create_embedding_service",
     "GeminiService",
     "LLMResponse",

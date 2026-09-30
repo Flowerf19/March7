@@ -27,3 +27,8 @@ watchdog
 
 # Token counting
 tiktoken
+
+# Local Harrier ONNX embeddings (no API)
+onnxruntime
+tokenizers
+numpy

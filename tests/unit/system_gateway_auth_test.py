@@ -8,6 +8,7 @@ import pytest
 from twin.shared.system_gateway.auth import (
     NonceStore,
     approval_replay_protection,
+    canonical_approval_action,
     canonical_message,
     extract_auth_headers,
     headers_from_signed,
@@ -301,3 +302,110 @@ def test_approval_token_nonce_is_unique_per_mint():
     b = mint_approval_token(secret=SECRET, action="system.status", actor="march7")
 
     assert a != b
+
+
+# --- Canonical approval actions (cross-group contract) -----------------------
+
+
+def test_canonical_shell_binds_execution_fields_and_excludes_approval_id():
+    base = {"command": "echo hi", "shell": "/bin/sh", "cwd": "/tmp", "timeout": 30}
+    with_token = dict(base, approval_id="tok-123", max_output_chars=256)
+    assert canonical_approval_action("shell", base) == canonical_approval_action(
+        "shell", with_token
+    )
+
+
+def test_canonical_shell_swapped_fields_change_binding():
+    base = {"command": "echo hi", "shell": "/bin/sh", "cwd": "/tmp", "timeout": 30}
+    canonical = canonical_approval_action("shell", base)
+    for swapped in (
+        {"command": "echo bye"},
+        {"shell": "/bin/bash"},
+        {"cwd": "/var"},
+        {"timeout": 60},
+    ):
+        mutated = dict(base, **swapped)
+        assert canonical_approval_action("shell", mutated) != canonical
+
+
+def test_canonical_shell_applies_protocol_defaults():
+    assert canonical_approval_action("shell", {"command": "echo hi"}) == (
+        canonical_approval_action(
+            "shell",
+            {"command": "  echo hi  ", "shell": "", "cwd": None, "timeout": None},
+        )
+    )
+    # Timeout clamps to server execution semantics (default 30, 1..300).
+    defaulted = canonical_approval_action("shell", {"command": "echo hi"})
+    assert canonical_approval_action(
+        "shell", {"command": "echo hi", "timeout": 99_999}
+    ) != defaulted
+    assert canonical_approval_action(
+        "shell", {"command": "echo hi", "timeout": 99_999}
+    ) == canonical_approval_action("shell", {"command": "echo hi", "timeout": 300})
+    assert canonical_approval_action(
+        "shell", {"command": "echo hi", "timeout": "bad"}
+    ) == defaulted
+
+
+def test_canonical_shell_rejects_empty_command():
+    for bad in ({}, {"command": ""}, {"command": "   "}):
+        try:
+            canonical_approval_action("shell", bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_canonical_self_update_binds_version_target():
+    base = {"from_version": "0.1.0", "to_version": "0.2.0"}
+    canonical = canonical_approval_action("self.update", base)
+    assert canonical_approval_action("self_update", base) == canonical
+    assert canonical_approval_action(
+        "self.update", dict(base, approval_id="tok")
+    ) == canonical
+    assert canonical_approval_action(
+        "self.update", {"from_version": "0.1.0", "to_version": "0.3.0"}
+    ) != canonical
+    assert canonical_approval_action(
+        "self.update", {"from_version": "0.1.0"}
+    ) != canonical
+
+
+def test_canonical_rejects_unsupported_actions():
+    for action in ("system.status", "container.restart", "", "  "):
+        try:
+            canonical_approval_action(action, {"command": "echo hi"})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {action!r}")
+
+
+def test_request_credential_cannot_mint_valid_approval():
+    request_secret = "request-key-only"
+    approval_secret = "approval-key-only"
+    payload = {"command": "echo hi", "timeout": 30}
+    action = canonical_approval_action("shell", payload)
+    forged = mint_approval_token(secret=request_secret, action=action, actor="march7")
+    result = verify_approval_token(
+        secret=approval_secret, token=forged, action=action, actor="march7"
+    )
+    assert result.valid is False
+    assert result.reason == "approval_signature_mismatch"
+
+
+def test_canonical_round_trip_through_mint_verify():
+    payload = {"command": "echo hi", "shell": "/bin/sh", "timeout": 30}
+    action = canonical_approval_action("shell", payload)
+    token = mint_approval_token(secret=SECRET, action=action, actor="march7")
+    assert verify_approval_token(
+        secret=SECRET, token=token, action=action, actor="march7"
+    ).valid is True
+    swapped = canonical_approval_action(
+        "shell", {"command": "echo bye", "shell": "/bin/sh", "timeout": 30}
+    )
+    assert verify_approval_token(
+        secret=SECRET, token=token, action=swapped, actor="march7"
+    ).valid is False

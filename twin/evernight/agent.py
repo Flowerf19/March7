@@ -167,9 +167,12 @@ class EvernightAgent:
         tags=["evernight"],
         process_outputs=summarize_trace_output,
     )
-    async def handle_chat(self, user_id: str, content: str) -> str:
+    async def handle_chat(
+        self, user_id: str, content: str, *, observe_input: bool = True
+    ) -> str:
         try:
-            await self.memory.add_message(user_id=user_id, role="user", content=content)
+            if observe_input:
+                await self.memory.add_message(user_id=user_id, role="user", content=content)
 
             sys_prompt, context_msgs = await self.memory.get_context(
                 user_id=user_id, current_query=content

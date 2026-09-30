@@ -16,6 +16,8 @@ import logging
 
 import pytest
 
+from types import SimpleNamespace
+from unit.memory.journal_fake import JournalFakeRedis
 from twin.shared.memory.active import ActiveEntry
 from twin.shared.memory.manager import SharedMemoryManager
 
@@ -27,13 +29,44 @@ class FakeT1:
         self._entries = entries or []
         self.get_context_calls: list[dict] = []
         self.trim_calls: list[tuple] = []
+        self.store = SimpleNamespace(redis=JournalFakeRedis())
 
     async def get_context(self, scope, scope_id, *, limit: int = 50):
         self.get_context_calls.append({"scope": scope, "scope_id": scope_id, "limit": limit})
         return list(self._entries)
 
+    async def get_entries_by_ids(self, scope, scope_id, entry_ids):
+        by_id = {e.entry_id: e for e in self._entries}
+        return [by_id[i] for i in entry_ids if i in by_id]
+
+    async def list_unsummarized_entries(self, scope, scope_id, limit=200):
+        return list(self._entries[-limit:])
+
     async def trim(self, scope, scope_id, entry_ids, *, keep_recent=None):
         self.trim_calls.append((scope, scope_id, list(entry_ids)))
+
+    async def trim_consolidated_batch(self, scope, scope_id, record, keep_recent=None):
+        import json as _json
+        from twin.shared.memory.consolidation_journal import caller_pending_key as _cpk
+        key = _cpk(scope, scope_id)
+        raw = self.store.redis._get_str(key)
+        if raw is None:
+            return {"status": "failed", "reason": "missing"}
+        try:
+            cur = _json.loads(raw)
+        except Exception:
+            return {"status": "failed", "reason": "corrupt"}
+        exp_ids = list((record or {}).get("entry_ids") or [])
+        if cur.get("entry_ids") != exp_ids or cur.get("caller_nonce") != (record or {}).get("caller_nonce"):
+            return {"status": "failed", "reason": "mismatch"}
+        if cur.get("stage") == "trimmed":
+            return {"status": "already"}
+        if cur.get("stage") != "acknowledged":
+            return {"status": "failed", "reason": "not_acked"}
+        self.trim_calls.append((scope, scope_id, list(exp_ids)))
+        cur["stage"] = "trimmed"
+        self.store.redis.strings[key] = _json.dumps(cur, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        return {"status": "trimmed", "deleted_ids": list(exp_ids), "subtracted": 0, "unsummarized_tokens": 0}
 
 
 class FakeConsolidationClient:
@@ -88,11 +121,17 @@ def _entry(entry_id: str, content: str) -> ActiveEntry:
 @pytest.mark.asyncio
 async def test_consolidate_scope_ships_entries_and_trims_by_returned_ids():
     t1 = FakeT1([_entry("e1", "hello"), _entry("e2", "world"), _entry("e3", "extra")])
-    # Consolidator reports back only the two ids it actually summarized.
-    client = FakeConsolidationClient({"status": "ok", "entry_ids": ["e1", "e2"]})
+    # Complete batch receipt required: ACK must cover all pinned IDs exactly
+    # (partial_ack rejected, no trim). Production tool always full-ACKs.
+    client = FakeConsolidationClient({
+        "status": "ok", "entry_ids": ["e1", "e2", "e3"],
+        "has_meaningful_content": True, "topics_stored": 2, "topics_failed": 0,
+        "receiver_generation": "f" * 32,
+    })
     manager = SharedMemoryManager(
         active=t1,  # type: ignore[arg-type]
         profile_store=FakeProfileStore(),  # type: ignore[arg-type]
+        timeline_summary_store=SimpleNamespace(redis=JournalFakeRedis()),
         consolidation_client=client,
     )
 
@@ -104,9 +143,8 @@ async def test_consolidate_scope_ships_entries_and_trims_by_returned_ids():
     assert shipped is not None and len(shipped) == 3
     assert {e["entry_id"] for e in shipped} == {"e1", "e2", "e3"}
     assert all("content" in e for e in shipped)
-    # Trim used exactly the entry_ids the consolidator returned — not a count,
-    # and not the in-flight "e3" that was never summarized.
-    assert t1.trim_calls == [("channel", "chan1", ["e1", "e2"])]
+    # Trim used exactly the entry_ids the consolidator returned — full batch.
+    assert t1.trim_calls == [("channel", "chan1", ["e1", "e2", "e3"])]
 
 
 @pytest.mark.asyncio

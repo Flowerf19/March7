@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -12,6 +13,7 @@ from gateway.adapters.discord.evernight_adapter import (
     EvernightDiscordAdapter,
     _EvernightAgentRouter,
 )
+from gateway.core.handler import GatewayChatHandler
 from gateway.shared.model import UnifiedChannel, UnifiedMessage, UnifiedUser
 from twin.shared.tools.approval_context import (
     ApprovalRequestContext,
@@ -226,7 +228,7 @@ async def test_evernight_discord_message_enters_gateway_contract(
     assert unified.extensions["is_addressed"] is True
     assert unified.extensions["is_mentioned"] is expected_mentioned
     assert unified.extensions["should_respond"] is True
-    assert unified.extensions["observe"] is False
+    assert unified.extensions["observe"] is True
     assert unified.extensions["assistant_id"] == "999"
     assert unified.extensions["assistant_name"] == "Evernight"
     assert get_current_approval_context() is None
@@ -250,5 +252,119 @@ async def test_evernight_local_router_only_routes_evernight():
     )
 
     assert response == "evernight reply"
-    assert agent.calls == [{"user_id": "u1", "content": "hello"}]
+    assert agent.calls == [{"user_id": "u1", "content": "hello", "observe_input": True}]
     assert wrong_route == ERROR_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_evernight_local_router_forwards_observe_input_flag():
+    agent = _FakeEvernightAgent()
+    router = _EvernightAgentRouter(agent)
+
+    await router.route(
+        agent_name="evernight",
+        user_id="u1",
+        content="already observed",
+        observe_input=False,
+    )
+
+    assert agent.calls == [
+        {"user_id": "u1", "content": "already observed", "observe_input": False}
+    ]
+
+
+class _FakeMemory:
+    """Local T1 double with the agent's observe semantics."""
+
+    def __init__(self) -> None:
+        self.observed: list[dict] = []
+
+    async def add_message(self, user_id: str, role: str, content: str) -> None:
+        self.observed.append({"user_id": user_id, "role": role, "content": content})
+
+
+class _FakeMemoryAgent:
+    """Evernight agent double: observes on handle_chat unless already done."""
+
+    def __init__(self) -> None:
+        self.memory = _FakeMemory()
+        self.calls: list[dict] = []
+
+    async def handle_chat(
+        self, user_id: str, content: str, observe_input: bool = True
+    ) -> str:
+        self.calls.append(
+            {"user_id": user_id, "content": content, "observe_input": observe_input}
+        )
+        if observe_input:
+            await self.memory.add_message(
+                user_id=user_id, role="user", content=content
+            )
+        return "evernight reply"
+
+
+@pytest.fixture
+def live_adapter(monkeypatch):
+    """Adapter wired to the real core handler and a memory-backed agent."""
+    monkeypatch.setattr(
+        adapter_module.DiscordMessageConverter,
+        "to_unified",
+        staticmethod(_fake_to_unified),
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "build_discord_approval_context",
+        _fake_approval_context,
+    )
+    monkeypatch.setattr("gateway.core.handler.MESSAGE_DEBOUNCE_SECONDS", 0)
+
+    bot_user = _FakeUser("999", display_name="Evernight", name="evernight", bot=True)
+    agent = _FakeMemoryAgent()
+    instance = EvernightDiscordAdapter.__new__(EvernightDiscordAdapter)
+    instance._agent = agent
+    instance._owner_user_id = OWNER_USER_ID
+    instance._handler = GatewayChatHandler(
+        agent_router=_EvernightAgentRouter(agent)
+    )
+    instance._bot = _FakeBot(bot_user)
+    return instance
+
+
+@pytest.mark.asyncio
+async def test_evernight_burst_preserves_every_input_single_reply(live_adapter):
+    messages = [_FakeMessage(content=f"burst {i}", guild=None) for i in range(3)]
+    for i, message in enumerate(messages):
+        message.id = 100 + i
+
+    await asyncio.gather(*(live_adapter._on_message(message) for message in messages))
+
+    agent = live_adapter._agent
+    assert agent.memory.observed == [
+        {"user_id": OWNER_USER_ID, "role": "user", "content": f"burst {i}"}
+        for i in range(3)
+    ]
+    assert len(agent.calls) == 1
+    assert agent.calls[0]["content"] == "burst 2"
+    assert agent.calls[0]["observe_input"] is False
+    assert messages[0].channel.sent == []
+    assert messages[1].channel.sent == []
+    assert messages[2].channel.sent == ["evernight reply"]
+
+
+@pytest.mark.asyncio
+async def test_evernight_ignores_bot_unauthorized_irrelevant(live_adapter):
+    bot_msg = _FakeMessage(content="bot noise", guild=None)
+    bot_msg.author = _FakeUser(OWNER_USER_ID, bot=True)
+    stranger_msg = _FakeMessage(content="!9 hack", guild=None)
+    stranger_msg.author = _FakeUser("123")
+    irrelevant_msg = _FakeMessage(content="random chat", guild=_FakeGuild())
+    empty_msg = _FakeMessage(content="   ", guild=None)
+
+    for message in (bot_msg, stranger_msg, irrelevant_msg, empty_msg):
+        await live_adapter._on_message(message)
+
+    agent = live_adapter._agent
+    assert agent.memory.observed == []
+    assert agent.calls == []
+    for message in (bot_msg, stranger_msg, irrelevant_msg, empty_msg):
+        assert message.channel.sent == []

@@ -1,5 +1,6 @@
 .git
 .env
+.env.*
 volumes/
 memories/
 __pycache__/

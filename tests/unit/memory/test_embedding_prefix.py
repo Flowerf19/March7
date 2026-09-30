@@ -7,7 +7,7 @@ must never embed or search T2 — recall happens only via the search_memory tool
 """
 from __future__ import annotations
 
-import importlib
+import importlib.util
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -77,13 +77,24 @@ def test_prefix_unescapes_literal_backslash_n(monkeypatch):
     """.env stores the prefix on one line with a literal backslash-n."""
     import twin.shared.config.settings as settings_module
 
+    original_config = settings_module.Config
+    original_prefix = original_config.EMBEDDING_QUERY_PREFIX
     monkeypatch.setenv("EMBEDDING_QUERY_PREFIX", "Instruct: test\\nQuery: ")
-    try:
-        reloaded = importlib.reload(settings_module)
-        assert reloaded.Config.EMBEDDING_QUERY_PREFIX == "Instruct: test\nQuery: "
-    finally:
-        monkeypatch.undo()
-        importlib.reload(settings_module)
+    # Isolated evaluation: never importlib.reload() the shared settings module
+    # (reload replaces Config globally and breaks later owner-approval tests).
+    # Same spec_from_file_location pattern as bootstrap script tests.
+    spec = importlib.util.spec_from_file_location(
+        "twin_shared_config_settings_isolated_prefix",
+        settings_module.__file__,
+    )
+    assert spec is not None and spec.loader is not None
+    isolated = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated)
+    assert isolated.Config.EMBEDDING_QUERY_PREFIX == "Instruct: test\nQuery: "
+    # Parent Config identity/values must survive this test.
+    assert settings_module.Config is original_config
+    assert settings_module.Config.EMBEDDING_QUERY_PREFIX == original_prefix
+    assert Config is original_config
 
 
 # --------------------------------------------------------- query composition

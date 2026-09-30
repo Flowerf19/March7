@@ -81,6 +81,9 @@ class EvernightContainer:
             timeline_summary_store=self.timeline_summary_store,
             owner_user_id=self.config.owner_user_id,
             gateway_monitor=self.gateway_monitor,
+            # Production self-DM: gateway_admin update requests its grant
+            # through this live gate (actor evernight, self endpoint).
+            use_evernight_dm_approval=True,
         )
         self.tool_registry = tools.registry
         self.llm_service.set_tool_registry(self.tool_registry)

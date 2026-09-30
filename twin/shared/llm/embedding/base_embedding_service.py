@@ -1,4 +1,4 @@
-"""Abstract base for embedding services (OpenAI-compat, Gemini, ...)."""
+"""Abstract base for embedding services (local Harrier ONNX)."""
 
 from __future__ import annotations
 
@@ -7,19 +7,16 @@ import logging
 import math
 from typing import TYPE_CHECKING, Any, List
 
-import aiohttp
-
 if TYPE_CHECKING:
     from .embedding_trace_logger import EmbeddingTraceLogger
 
 
 class BaseEmbeddingService(abc.ABC):
     """
-    Common interface for all embedding providers.
+    Common interface for embedding backends.
 
-    Subclasses implement `get_embedding(text)` against a specific provider's
-    HTTP protocol. Shared concerns (aiohttp session, in-memory LRU cache,
-    cleanup) live here so providers stay focused on payload shape.
+    Subclasses implement `get_embedding(text)`. Shared concerns (in-memory
+    LRU cache, dim-fit, trace events) live here.
     """
 
     def __init__(
@@ -36,20 +33,14 @@ class BaseEmbeddingService(abc.ABC):
         self.expected_dim = expected_dim
         self._cache: dict[str, List[float]] = {}
         self._cache_size = cache_size
-        self._session: aiohttp.ClientSession | None = None
         self.logger = logging.getLogger(f"discord_bot.{self.__class__.__name__}")
         self.trace_logger = trace_logger
         self.provider = provider
         self.api_url = api_url
 
     async def initialize(self) -> None:
-        """Hook for subclasses to validate config (e.g. API key). No-op by default."""
+        """Hook for subclasses to validate config. No-op by default."""
         return None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
 
     def _cache_get(self, text: str) -> List[float] | None:
         return self._cache.get(text)
@@ -103,9 +94,56 @@ class BaseEmbeddingService(abc.ABC):
         rrf_rank: int | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        """Emit a trace record if a trace logger is configured."""
+        """Emit a trace record if a trace logger is configured.
+
+        Best-effort: trace I/O (disk-full, unwritable path) must never break
+        a valid inference, on either the fresh or the cached path.
+        """
         if self.trace_logger is None:
             return
+        try:
+            self._emit_trace_event(
+                event_type=event_type,
+                input_text=input_text,
+                vector=vector,
+                raw_dim=raw_dim,
+                latency_ms=latency_ms,
+                cache_hit=cache_hit,
+                query_text=query_text,
+                matched_text=matched_text,
+                cosine_similarity=cosine_similarity,
+                token_overlap=token_overlap,
+                action=action,
+                knn_score=knn_score,
+                bm25_score=bm25_score,
+                rrf_rank=rrf_rank,
+                extra=extra,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Embedding trace log failed (best-effort, continuing): %s", exc,
+            )
+
+    def _emit_trace_event(
+        self,
+        *,
+        event_type: str,
+        input_text: str,
+        vector: List[float],
+        raw_dim: int | None,
+        latency_ms: float,
+        cache_hit: bool,
+        query_text: str | None,
+        matched_text: str | None,
+        cosine_similarity: float | None,
+        token_overlap: float | None,
+        action: str | None,
+        knn_score: float | None,
+        bm25_score: float | None,
+        rrf_rank: int | None,
+        extra: dict[str, Any] | None,
+    ) -> None:
+        assert self.trace_logger is not None
         self.trace_logger.log(
             event_type=event_type,
             model_name=self.model_name,
@@ -129,9 +167,8 @@ class BaseEmbeddingService(abc.ABC):
         )
 
     async def close(self) -> None:
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
+        """Hook for subclasses to release resources. No-op by default."""
+        return None
 
     @abc.abstractmethod
     async def get_embedding(self, text: str) -> List[float]:

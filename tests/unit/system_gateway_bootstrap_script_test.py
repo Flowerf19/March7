@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 
@@ -84,3 +85,121 @@ def test_gateway_install_on_linux_runs_cli_install(monkeypatch, tmp_path: Path):
     assert ran[0][0] == [str(venv_python), "-m", "system_gateway", "install"]
     assert ran[0][1]["SYSTEM_GATEWAY_HOST"] == bootstrap.HOST
     assert ran[0][1]["SYSTEM_GATEWAY_PORT"] == bootstrap.PORT
+
+
+def test_approval_secret_file_respects_env_override(monkeypatch, tmp_path: Path):
+    bootstrap = _load_bootstrap_module()
+    target = tmp_path / "custom" / "approval_secret"
+    monkeypatch.setenv("SYSTEM_GATEWAY_APPROVAL_SECRET_FILE", str(target))
+    assert bootstrap.approval_secret_file_path() == target
+
+
+def test_secret_file_path_respects_shared_env_override(monkeypatch, tmp_path: Path):
+    bootstrap = _load_bootstrap_module()
+    target = tmp_path / "custom" / "secret"
+    monkeypatch.setenv("SYSTEM_GATEWAY_SHARED_SECRET_FILE", str(target))
+    assert bootstrap.secret_file_path() == target
+
+
+def test_bootstrap_macos_uses_library_not_config(monkeypatch, tmp_path: Path):
+    from system_gateway import paths as gateway_paths
+
+    bootstrap = _load_bootstrap_module()
+    bootstrap._PATHS_CACHE = None
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("SYSTEM_GATEWAY_SHARED_SECRET_FILE", raising=False)
+    monkeypatch.delenv("SYSTEM_GATEWAY_APPROVAL_SECRET_FILE", raising=False)
+    base = tmp_path / "Library" / "Application Support" / "system-gateway"
+    assert bootstrap.secret_file_path() == base / "secret"
+    assert bootstrap.approval_secret_file_path() == base / "approval_secret"
+    assert bootstrap.config_dir() == base
+    assert gateway_paths.default_shared_secret_file() == base / "secret"
+
+
+def test_bootstrap_linux_nonroot_uses_home_not_etc(monkeypatch, tmp_path: Path):
+    from system_gateway import paths as gateway_paths
+
+    bootstrap = _load_bootstrap_module()
+    bootstrap._PATHS_CACHE = None
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("SYSTEM_GATEWAY_SHARED_SECRET_FILE", raising=False)
+    monkeypatch.delenv("SYSTEM_GATEWAY_APPROVAL_SECRET_FILE", raising=False)
+    monkeypatch.setattr(gateway_paths, "is_root", lambda: False)
+    monkeypatch.setattr(gateway_paths, "_etc_usable_for_state", lambda: False)
+    b_paths = bootstrap._unified_paths()
+    if b_paths is not gateway_paths:
+        monkeypatch.setattr(b_paths, "is_root", lambda: False)
+        monkeypatch.setattr(b_paths, "_etc_usable_for_state", lambda: False)
+    base = tmp_path / ".config" / "system-gateway"
+    assert bootstrap.config_dir() == base
+    assert bootstrap.secret_file_path() == base / "secret"
+    assert bootstrap.approval_secret_file_path() == base / "approval_secret"
+
+
+def test_bootstrap_windows_admin_vs_user(monkeypatch, tmp_path: Path):
+    from system_gateway import paths as gateway_paths
+
+    bootstrap = _load_bootstrap_module()
+    bootstrap._PATHS_CACHE = None
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    pd = tmp_path / "ProgramData"
+    la = tmp_path / "LocalAppData"
+    monkeypatch.setenv("ProgramData", str(pd))
+    monkeypatch.setenv("LOCALAPPDATA", str(la))
+    monkeypatch.delenv("SYSTEM_GATEWAY_SHARED_SECRET_FILE", raising=False)
+    monkeypatch.delenv("SYSTEM_GATEWAY_APPROVAL_SECRET_FILE", raising=False)
+    b_paths = bootstrap._unified_paths()
+    monkeypatch.setattr(gateway_paths, "_is_windows_admin", lambda: True)
+    if b_paths is not gateway_paths:
+        monkeypatch.setattr(b_paths, "_is_windows_admin", lambda: True)
+    assert bootstrap.secret_file_path() == pd / "system-gateway" / "secret"
+    monkeypatch.setattr(gateway_paths, "_is_windows_admin", lambda: False)
+    if b_paths is not gateway_paths:
+        monkeypatch.setattr(b_paths, "_is_windows_admin", lambda: False)
+    assert bootstrap.secret_file_path() == la / "system-gateway" / "secret"
+
+
+def test_ensure_approval_secret_creates_restricted_file(monkeypatch, tmp_path: Path):
+    bootstrap = _load_bootstrap_module()
+    target = tmp_path / "host-private" / "approval_secret"
+    monkeypatch.setenv("SYSTEM_GATEWAY_APPROVAL_SECRET_FILE", str(target))
+    messages: list[str] = []
+    monkeypatch.setattr(bootstrap, "info", messages.append)
+
+    returned = bootstrap.ensure_approval_secret()
+
+    assert returned == target
+    secret = target.read_text(encoding="utf-8").strip()
+    assert secret
+    assert len(secret) >= 32
+    if sys.platform.startswith("linux") or sys.platform == "darwin":
+        assert oct(target.stat().st_mode)[-3:] == "600"
+    # Value never logged; path is outside the repo.
+    assert all(secret not in message for message in messages)
+    assert str(bootstrap.REPO_ROOT) not in str(target)
+
+
+def test_ensure_approval_secret_keeps_existing_and_ignores_env(
+    monkeypatch, tmp_path: Path
+):
+    bootstrap = _load_bootstrap_module()
+    target = tmp_path / "approval_secret"
+    target.write_text("keep-approval", encoding="utf-8")
+    monkeypatch.setenv("SYSTEM_GATEWAY_APPROVAL_SECRET_FILE", str(target))
+    monkeypatch.setenv("SYSTEM_GATEWAY_APPROVAL_SECRET", "inline-forbidden")
+    fake_env = tmp_path / ".env"
+    monkeypatch.setattr(bootstrap, "ENV_FILE", fake_env)
+    messages: list[str] = []
+    monkeypatch.setattr(bootstrap, "info", messages.append)
+
+    assert bootstrap.ensure_approval_secret() == target
+    assert target.read_text(encoding="utf-8") == "keep-approval"
+    # Never writes the approval key into the shared repo .env.
+    assert not fake_env.exists()
+    assert all("keep-approval" not in message for message in messages)

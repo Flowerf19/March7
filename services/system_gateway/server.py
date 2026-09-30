@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hmac
 import json as jsonlib
 import logging
-import time
 from typing import Any
 
 from aiohttp import web
 
+from .approval_ledger import ApprovalLedger, LedgerUnavailable
 from .capabilities import capabilities_payload, select_adapter
 from .config import GatewayConfig
+from .paths import default_approval_ledger_file
 from .state import SERVICE_VERSION, GatewayState
 
 logger = logging.getLogger(__name__)
@@ -38,6 +41,49 @@ def _config(request: web.Request) -> GatewayConfig:
         except (KeyError, TypeError):
             pass
     return request.app[CONFIG_KEY]
+
+
+def _secrets_equal(first: str | None, second: str | None) -> bool:
+    """True when both credentials are set and equal (no values logged)."""
+
+    if not first or not second:
+        return False
+    try:
+        return hmac.compare_digest(
+            first.encode("utf-8"), second.encode("utf-8")
+        )
+    except (TypeError, ValueError):
+        return first == second
+
+
+def _token_expiry(token: Any) -> int | None:
+    """Extract ``exp`` from an approval token payload for ledger pruning."""
+
+    if not token or not isinstance(token, str) or "." not in token:
+        return None
+    payload_part = token.rsplit(".", 1)[0]
+    try:
+        padding = "=" * (-len(payload_part) % 4)
+        payload = jsonlib.loads(
+            base64.urlsafe_b64decode(payload_part + padding).decode("utf-8")
+        )
+        exp = int(payload.get("exp"))
+    except Exception:
+        return None
+    return exp if exp > 0 else None
+
+
+def _consume_nonce(
+    state: GatewayState, nonce: str | None, token: Any
+) -> tuple[bool, bool]:
+    """Claim a nonce durably. Returns (claimed, ledger_ok)."""
+
+    try:
+        claimed = state.consume_approval(nonce, expiry=_token_expiry(token))
+    except LedgerUnavailable:
+        logger.warning("system_gateway: approval ledger unavailable; denying")
+        return False, False
+    return claimed, True
 
 
 async def health(request: web.Request) -> web.Response:
@@ -131,10 +177,14 @@ async def run_shell(request: web.Request) -> web.Response:
     """Generic shell-exec endpoint.
 
     Runs the owner-approved *command* on the platform shell. Security layers, in
-    order: HMAC auth (middleware) -> raw_shell kill-switch -> action-bound
-    single-use approval token ("shell", actor-bound) -> the adapter spawns the
-    command verbatim. The owner sees the exact command in the approval prompt, so
-    there is no divergence between what is shown and what runs.
+    order: HMAC request auth (middleware, shared request key) -> raw_shell
+    opt-in kill-switch -> canonical-action-bound single-use approval token
+    (command/shell/cwd/timeout via ``canonical_approval_action``, verified
+    with the separate owner approval key, actor-bound) -> the adapter spawns
+    the command verbatim. The owner sees the exact command in the approval
+    prompt, so there is no divergence between what is shown and what runs.
+    March7 never mints approvals; only the owner-trusted issuer (Evernight /
+    owner CLI) holds the approval key.
     """
 
     from twin.shared.system_gateway.policy import (
@@ -152,7 +202,10 @@ async def run_shell(request: web.Request) -> web.Response:
         EVENT_APPROVAL_RESOLVED,
         audit_event,
     )
-    from twin.shared.system_gateway.auth import verify_approval_token
+    from twin.shared.system_gateway.auth import (
+        canonical_approval_action,
+        verify_approval_token,
+    )
 
     state = _state(request)
     config = _config(request)
@@ -199,27 +252,44 @@ async def run_shell(request: web.Request) -> web.Response:
             approval_id=approval_id,
             capabilities=caps,
         ),
-        consumed_approvals=state.consumed_approvals,
+        # Replay is enforced by the durable ledger after token verification.
+        consumed_approvals=None,
     )
 
     if decision.verdict.value == "deny":
         return _deny_shell(decision.reason.value)
 
+    # Misconfigured equal credentials must never let the request signer
+    # mint owner approvals; deny before verification (no secret values).
+    if _secrets_equal(state.shared_secret, state.approval_secret):
+        logger.warning("system_gateway: equal request/approval credentials; denying")
+        return _deny_shell(PolicyReason.APPROVAL_INVALID.value)
+
     if not command:
         return _deny_shell(PolicyReason.APPROVAL_INVALID.value)
 
-    # The approval token binds to the canonical action "shell" + the actor and
-    # is single-use. verify checks authenticity; consume is the replay guard.
+    # The approval token binds the canonical execution payload
+    # (command/shell/cwd/timeout) + the actor and is single-use. verify checks
+    # authenticity with the separate owner approval key (never the request
+    # key); consume is the replay guard. Missing approval key fails closed.
+    try:
+        expected_action = canonical_approval_action("shell", payload)
+    except ValueError:
+        return _deny_shell(PolicyReason.APPROVAL_INVALID.value)
     token_result = verify_approval_token(
-        secret=state.shared_secret,
+        secret=state.approval_secret,
         token=approval_id,
-        action="shell",
+        action=expected_action,
         actor=actor,
     )
     if not token_result.valid:
         return _deny_shell(PolicyReason.APPROVAL_INVALID.value)
 
-    if not state.consume_approval(token_result.nonce):
+    # Durably claim the nonce BEFORE executing. Ledger failure fails closed.
+    claimed, ledger_ok = _consume_nonce(state, token_result.nonce, approval_id)
+    if not ledger_ok:
+        return _deny_shell(PolicyReason.APPROVAL_INVALID.value)
+    if not claimed:
         return _deny_shell(PolicyReason.APPROVAL_REPLAYED.value)
 
     state.record_audit(
@@ -366,7 +436,10 @@ async def self_update(request: web.Request) -> web.Response:
     admin (see ``system-gateway install`` / ``system-gateway uninstall``).
     """
 
-    from twin.shared.system_gateway.auth import verify_approval_token
+    from twin.shared.system_gateway.auth import (
+        canonical_approval_action,
+        verify_approval_token,
+    )
     from twin.shared.system_gateway.audit import (
         AuditOutcome,
         EVENT_APPROVAL_RESOLVED,
@@ -401,17 +474,40 @@ async def self_update(request: web.Request) -> web.Response:
             approval_id=approval_id,
             capabilities=caps,
         ),
-        consumed_approvals=state.consumed_approvals,
+        # Replay is enforced by the durable ledger after token verification.
+        consumed_approvals=None,
     )
     if decision.verdict.value == "deny":
         return _deny_action(
             state, actor, "self.update", approval_id, decision.reason.value, 30
         )
 
+    if _secrets_equal(state.shared_secret, state.approval_secret):
+        logger.warning("system_gateway: equal request/approval credentials; denying")
+        return _deny_action(
+            state,
+            actor,
+            "self.update",
+            approval_id,
+            PolicyReason.APPROVAL_INVALID.value,
+            30,
+        )
+
+    try:
+        expected_update = canonical_approval_action("self.update", payload)
+    except ValueError:
+        return _deny_action(
+            state,
+            actor,
+            "self.update",
+            approval_id,
+            PolicyReason.APPROVAL_INVALID.value,
+            30,
+        )
     token_result = verify_approval_token(
-        secret=state.shared_secret,
+        secret=state.approval_secret,
         token=approval_id,
-        action="self.update",
+        action=expected_update,
         actor=actor,
     )
     if not token_result.valid:
@@ -424,7 +520,18 @@ async def self_update(request: web.Request) -> web.Response:
             30,
         )
 
-    if not state.consume_approval(token_result.nonce):
+    # Durably claim the nonce BEFORE recording the update request.
+    claimed, ledger_ok = _consume_nonce(state, token_result.nonce, approval_id)
+    if not ledger_ok:
+        return _deny_action(
+            state,
+            actor,
+            "self.update",
+            approval_id,
+            PolicyReason.APPROVAL_INVALID.value,
+            30,
+        )
+    if not claimed:
         return _deny_action(
             state,
             actor,
@@ -482,11 +589,20 @@ def create_app(config: GatewayConfig | None = None) -> web.Application:
     """Create the aiohttp application."""
 
     resolved = config or GatewayConfig.from_env()
+    ledger_path = resolved.approval_ledger_file or default_approval_ledger_file()
+    try:
+        ledger = ApprovalLedger(ledger_path)
+    except LedgerUnavailable as exc:
+        # Fail closed for mutations; health/capabilities stay public.
+        logger.warning("system_gateway: %s", exc)
+        ledger = None
     app = web.Application(middlewares=[auth_middleware])
     app[CONFIG_KEY] = resolved
     app[STATE_KEY] = GatewayState(
         raw_shell_enabled=resolved.raw_shell_enabled,
         shared_secret=resolved.shared_secret,
+        approval_secret=resolved.approval_secret,
+        approval_ledger=ledger,
     )
     app.router.add_get("/health", health)
     app.router.add_get("/capabilities", capabilities)
@@ -513,6 +629,9 @@ def _extract_headers(request: web.Request) -> dict[str, str]:
 
 
 def _coerce_timeout(value: Any) -> int:
+    # Must match canonical_approval_action timeout normalization in
+    # twin.shared.system_gateway.auth (default 30, clamp 1..300) so the
+    # executed timeout equals the approved timeout.
     try:
         if value is None:
             return 30

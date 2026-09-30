@@ -94,7 +94,7 @@ def build_tool_registry(
     """Build one registry for an agent from the shared declared tool catalog."""
     tavily_mcp_client = _init_tavily_mcp_client()
     codebox_client = _init_codebox_client()
-    host_gateway_client = _init_host_gateway_client()
+    host_gateway_client = _init_host_gateway_client(agent_name=agent_name)
 
     if approval_gate is None:
         approval_gate = _build_approval_gate(
@@ -188,7 +188,7 @@ def _build_approval_gate(
     if not evernight_url:
         return ApprovalGate()
 
-    dm_client = DMClient(evernight_url=evernight_url)
+    dm_client = DMClient(evernight_url=evernight_url, actor=agent_name)
     logger.info("DM approval client configured for %s: %s", agent_name, evernight_url)
     return ApprovalGate(dm_client=dm_client)
 
@@ -216,7 +216,7 @@ def _init_codebox_client() -> Optional[CodeBoxClient]:
         return None
 
 
-def _init_host_gateway_client() -> Optional[HostGatewayClient]:
+def _init_host_gateway_client(*, agent_name: str) -> Optional[HostGatewayClient]:
     gateway_url = getattr(Config, "SYSTEM_GATEWAY_URL", "")
     if not gateway_url:
         return None
@@ -225,7 +225,7 @@ def _init_host_gateway_client() -> Optional[HostGatewayClient]:
             base_url=gateway_url,
             timeout=Config.SYSTEM_GATEWAY_TIMEOUT,
             shared_secret=Config.SYSTEM_GATEWAY_SHARED_SECRET,
-            actor="march7",
+            actor=agent_name,
         )
     except Exception as exc:
         logger.warning("System Gateway client init failed: %s", exc)

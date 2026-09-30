@@ -95,3 +95,34 @@ async def test_evernight_chat_reasoning_only_response_not_saved():
     assert memory.messages == [
         {"user_id": "u1", "role": "user", "content": "phân tích đi"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_evernight_chat_observe_input_true_persists_user_message():
+    memory = FakeMemoryManager()
+    agent = _make_agent(memory, response="rõ rồi")
+
+    response = await agent.handle_chat(
+        user_id="u1", content="nhớ giúp tôi", observe_input=True
+    )
+
+    assert response == "rõ rồi"
+    assert memory.messages == [
+        {"user_id": "u1", "role": "user", "content": "nhớ giúp tôi"},
+        {"user_id": "u1", "role": "assistant", "content": "rõ rồi"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_evernight_chat_observe_input_false_skips_user_persist():
+    memory = FakeMemoryManager()
+    agent = _make_agent(memory, response="rõ rồi")
+
+    response = await agent.handle_chat(
+        user_id="u1", content="đã observe trước", observe_input=False
+    )
+
+    assert response == "rõ rồi"
+    assert memory.messages == [
+        {"user_id": "u1", "role": "assistant", "content": "rõ rồi"},
+    ]

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
+from twin.shared.memory.profile.file_io import ProfileFileIO
 from twin.shared.tools.registry.base import BaseTool, ToolExecutionError
 
 logger = logging.getLogger(__name__)
@@ -107,16 +108,10 @@ class UpdatePersonalityTool(BaseTool):
     def _target_path(self, filename: str) -> Path:
         return self._persona_dir() / filename
 
-    def _read_current_content(self, file_path: str) -> str:
-        """Read current file content for bot to merge."""
-        try:
-            if os.path.exists(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    return f.read()
-            return ""
-        except Exception as e:
-            logger.warning(f"Không thể đọc file {file_path}: {e}")
-            return ""
+    @staticmethod
+    def _atomic_write_sync(path: Path, content: str) -> None:
+        """Hardened persona write; old file survives pre-replace faults."""
+        ProfileFileIO.atomic_write_sync(path, content)
 
     # ==========================================
     # EXECUTION
@@ -141,8 +136,7 @@ class UpdatePersonalityTool(BaseTool):
             file_path = self._target_path(target)
             os.makedirs(file_path.parent, exist_ok=True)
             content = instruction if instruction.endswith("\n") else f"{instruction}\n"
-            with file_path.open("w", encoding="utf-8") as f:
-                f.write(content)
+            self._atomic_write_sync(file_path, content)
             if self.llm_service and hasattr(self.llm_service, "reload_persona_prompts"):
                 self.llm_service.reload_persona_prompts()
             logger.info("✅ UpdatePersonalityTool: Đã viết lại %s", file_path)

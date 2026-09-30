@@ -12,19 +12,28 @@ inside a scheduled task or a third-party service wrapper.
    python -m pip install -e services\system_gateway
    ```
 
-2. Generate a shared secret once:
+2. Generate secrets once (request secret + separate owner approval key):
 
    ```powershell
    python -m system_gateway pair --secret-file %LOCALAPPDATA%\system-gateway\secret
    ```
 
-3. Set the environment variable before starting the service:
+   `pair` also creates the owner approval key at `%LOCALAPPDATA%\system-gateway\approval_secret`
+   for user runs (`%ProgramData%\system-gateway\approval_secret` for the admin
+   service install; override with `--approval-secret-file`). Its value is never
+   printed and must never be copied into the shared repo `.env`.
+
+3. Set the environment variables before starting the service:
 
    ```powershell
    $env:SYSTEM_GATEWAY_SHARED_SECRET_FILE = "$env:LOCALAPPDATA\system-gateway\secret"
+   $env:SYSTEM_GATEWAY_APPROVAL_SECRET_FILE = "$env:LOCALAPPDATA\system-gateway\approval_secret"
    $env:SYSTEM_GATEWAY_HOST = "127.0.0.1"
    $env:SYSTEM_GATEWAY_PORT = "8380"
+   $env:SYSTEM_GATEWAY_RAW_SHELL = "true"
    ```
+
+   Raw shell is denied by default and requires explicit opt-in.
 
 4. Run the gateway:
 

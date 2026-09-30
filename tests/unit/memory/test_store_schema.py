@@ -254,10 +254,14 @@ async def test_hybrid_search_bm25_cannot_bypass_gate(monkeypatch):
         {"summary_id": "kept", "score": 0.1},
         {"summary_id": "gated", "score": 0.9},
     ]
-    # BM25 (ungated) resurfaces the same "gated" doc, plus a pure-BM25-only doc.
+    # BM25 (ungated) resurfaces the same "gated" doc, plus a pure-BM25-only
+    # doc with a query-aligned embedding (cosine 1.0, passes the floor) and
+    # one BM25-only doc with no embedding (fail-closed: dropped, #25).
+    aligned = [1.0] + [0.0] * 383
     bm25_hits = [
         {"summary_id": "gated"},
-        {"summary_id": "bm25_only"},
+        {"summary_id": "bm25_only", "embedding": list(aligned)},
+        {"summary_id": "bm25_no_embedding"},
     ]
 
     async def fake_search_knn(user_id, query_embedding, limit, topic_filter):
@@ -269,12 +273,13 @@ async def test_hybrid_search_bm25_cannot_bypass_gate(monkeypatch):
     monkeypatch.setattr(store, "_search_knn", fake_search_knn)
     monkeypatch.setattr(store, "_search_bm25", fake_search_bm25)
 
-    results = await store.search("111", [0.0] * 384, limit=5, query_text="anything")
+    results = await store.search("111", aligned, limit=5, query_text="anything")
     ids = {r["summary_id"] for r in results}
 
     assert "gated" not in ids
     assert "kept" in ids
     assert "bm25_only" in ids
+    assert "bm25_no_embedding" not in ids
 
 
 @pytest.mark.asyncio
@@ -566,6 +571,7 @@ def _resp2_diary_hit(
     *, summary_id: str, summary: str, score: float, dim: int = 8,
     importance: int = 3, period_start: float | None = None,
     period_end: float | None = None, source_entry_ids: list[str] | None = None,
+    topic: str | None = "general", topic_display: str | None = None,
 ):
     """RESP2 flat pair-list FT.SEARCH reply with one same-day KNN hit."""
     fields = [
@@ -575,6 +581,10 @@ def _resp2_diary_hit(
         b"embedding", struct.pack(f"{dim}f", *([1.0] + [0.0] * (dim - 1))),
         b"score", str(score).encode(),
     ]
+    if topic is not None:
+        fields += [b"topic", topic.encode()]
+    if topic_display is not None:
+        fields += [b"topic_display", topic_display.encode()]
     if period_start is not None:
         fields += [b"period_start", str(period_start).encode()]
     if period_end is not None:
@@ -910,23 +920,37 @@ async def test_bm25_query_applies_time_filter():
 
 
 @pytest.mark.asyncio
-async def test_get_recent_no_time_filter_omits_dialect():
-    """Unfiltered get_recent must keep its exact pre-P3.2 argument list —
-    no DIALECT param was ever passed for the plain tag-only query."""
+async def test_get_recent_partitions_by_period_end_presence():
+    """Unfiltered get_recent windows each partition independently: top-n by
+    period_end plus top-n missing-period_end by created_at (a single
+    SORTBY period_end + LIMIT window would evict newer legacy docs before
+    the Python re-sort ever sees them). The modern branch is a plain AND
+    (no DIALECT); only the negation branch needs DIALECT 2."""
     redis = DiaryRedis([0])
     store = TimelineSummaryStore(redis_client=redis, embedding_dim=8)
 
     await store.get_recent("u1", limit=10)
 
-    args = redis.search_calls[-1]
-    assert args[2] == "@user_id:{u1}"
-    assert "DIALECT" not in args
+    assert len(redis.search_calls) == 2
+    modern, legacy = redis.search_calls
+    assert modern[2] == "@user_id:{u1} @period_end:[-inf +inf]"
+    assert "DIALECT" not in modern
+    assert list(modern)[list(modern).index("SORTBY") + 1] == "period_end"
+    assert legacy[2] == "@user_id:{u1} -@period_end:[-inf +inf]"
+    assert "DIALECT" in legacy and "2" in legacy
+    assert list(legacy)[list(legacy).index("SORTBY") + 1] == "created_at"
+    for call in redis.search_calls:
+        args = list(call)
+        assert args[args.index("LIMIT") + 1:args.index("LIMIT") + 3] == ["0", "10"]
 
 
 @pytest.mark.asyncio
-async def test_get_recent_applies_since_ts_and_dialect2():
-    """DIALECT 2 is added only once the OR/negation time_clause is in play —
-    same construct _search_knn/_search_bm25 already rely on DIALECT 2 for."""
+async def test_get_recent_applies_since_ts_per_branch_and_dialect2():
+    """Time bounds apply per partition — period_end range on the modern
+    branch, created_at range on the missing-period_end branch (the same
+    OR-fallback policy as the KNN/BM25 time clause, split so each branch
+    stays a natively windowable query). Same canned hit on both branches
+    dedups to one result."""
     redis = DiaryRedis(_resp2_diary_hit(
         summary_id="r1", summary="tin tuc hom qua", score=0.1, period_end=5000.0,
     ))
@@ -936,9 +960,13 @@ async def test_get_recent_applies_since_ts_and_dialect2():
 
     assert len(results) == 1
     assert results[0]["summary_id"] == "r1"
-    args = redis.search_calls[-1]
-    assert "@period_end:[1000.0 +inf]" in args[2]
-    assert "DIALECT" in args and "2" in args
+    assert len(redis.search_calls) == 2
+    modern, legacy = redis.search_calls
+    assert "@period_end:[1000.0 +inf]" in modern[2]
+    assert "created_at" not in modern[2]
+    assert "-@period_end:[-inf +inf]" in legacy[2]
+    assert "@created_at:[1000.0 +inf]" in legacy[2]
+    assert "DIALECT" in modern and "DIALECT" in legacy
 
 
 # ---------------------------------------------------------------- P3.5: BM25-only gate
@@ -977,13 +1005,14 @@ async def test_hybrid_search_gates_bm25_only_doc_by_cosine(monkeypatch):
     assert "high_cos" in ids
 
 
-def test_gate_bm25_only_by_cosine_noop_when_floor_zero():
+def test_gate_bm25_only_by_cosine_noop_when_floor_zero(monkeypatch):
+    monkeypatch.setattr(Config, "T2_MIN_COSINE", 0.0)
     store = TimelineSummaryStore(redis_client=MagicMock(), embedding_dim=4)
     fused = [{"summary_id": "a", "embedding": [0.0, 1.0, 0.0, 0.0]}]
 
     out = store._gate_bm25_only_by_cosine(fused, knn_results=[], query_embedding=[1.0, 0.0, 0.0, 0.0])
 
-    assert out == fused  # Config.T2_MIN_COSINE default 0.0 -> no-op
+    assert out == fused  # owner opt-out floor 0.0 -> no-op
 
 
 def test_gate_bm25_only_by_cosine_skips_docs_already_seen_by_knn(monkeypatch):
@@ -999,13 +1028,287 @@ def test_gate_bm25_only_by_cosine_skips_docs_already_seen_by_knn(monkeypatch):
     assert out == fused
 
 
-def test_gate_bm25_only_by_cosine_keeps_doc_missing_embedding(monkeypatch):
-    """Fail open: nothing to score against, so a doc with no embedding field
-    passes through rather than being dropped."""
+def test_gate_bm25_only_by_cosine_drops_doc_missing_embedding(monkeypatch):
+    """Fail closed (#25): a BM25-only doc with no embedding cannot prove it
+    clears the floor, so it is dropped while the gate is active — keeping
+    it would let BM25 bypass T2_MIN_COSINE entirely."""
     monkeypatch.setattr(Config, "T2_MIN_COSINE", 0.9)
     store = TimelineSummaryStore(redis_client=MagicMock(), embedding_dim=4)
     fused = [{"summary_id": "no_embedding"}]
 
     out = store._gate_bm25_only_by_cosine(fused, knn_results=[], query_embedding=[1.0, 0.0, 0.0, 0.0])
 
-    assert out == fused
+    assert out == []
+
+
+# ---------------------------------------------------------------- #25: embedding decode + fail-closed gates
+# FLOAT32 bytes must be unpacked from RAW bytes before any text decoding:
+# struct.pack('8f', *([0.5]*8)) is valid UTF-8, and the old decode-first
+# order turned it into str -> unpack -> [], silently disarming the cosine
+# gate for BM25-only docs.
+
+
+def test_decode_fields_unpacks_utf8_valid_embedding_bytes():
+    """[0.5]*8 packs to UTF-8-valid bytes — must round-trip to floats."""
+    raw = struct.pack("8f", *([0.5] * 8))
+    assert raw.decode("utf-8")  # precondition: the old code took the str path
+    decoded = decode_fields([b"embedding", raw])
+    assert decoded["embedding"] == [0.5] * 8
+
+
+def test_decode_fields_rejects_non_buffer_embeddings():
+    """Truncated buffers, str, and None decode to [] (unverifiable)."""
+    assert decode_fields([b"embedding", b"\x00" * 6])["embedding"] == []
+    assert decode_fields([b"embedding", "not bytes"])["embedding"] == []
+    assert decode_fields([(b"embedding"), None])["embedding"] == []
+    assert decode_fields([b"embedding", b""])["embedding"] == []
+    # Honest float lists still pass through (RESP3 / already-decoded).
+    assert decode_fields([b"embedding", [1.0, 0.0]])["embedding"] == [1.0, 0.0]
+
+
+def test_decode_fields_parses_merge_version_as_int():
+    decoded = decode_fields([b"merge_version", b"3"])
+    assert decoded["merge_version"] == 3
+    assert decode_fields([b"merge_version", b"junk"])["merge_version"] == "junk"
+
+
+def test_gate_bm25_only_drops_wrong_dim_embedding(monkeypatch):
+    monkeypatch.setattr(Config, "T2_MIN_COSINE", 0.35)
+    store = TimelineSummaryStore(redis_client=MagicMock(), embedding_dim=4)
+    fused = [{"summary_id": "wrong_dim", "embedding": [1.0, 0.0]}]  # dim 2 vs 4
+
+    out = store._gate_bm25_only_by_cosine(
+        fused, knn_results=[], query_embedding=[1.0, 0.0, 0.0, 0.0],
+    )
+    assert out == []
+
+
+def test_gate_bm25_only_drops_nonfinite_embedding(monkeypatch):
+    monkeypatch.setattr(Config, "T2_MIN_COSINE", 0.35)
+    store = TimelineSummaryStore(redis_client=MagicMock(), embedding_dim=4)
+    fused = [
+        {"summary_id": "inf_cos", "embedding": [float("inf")] * 4},
+        {"summary_id": "nan_cos", "embedding": [float("nan")] * 4},
+    ]
+
+    out = store._gate_bm25_only_by_cosine(
+        fused, knn_results=[], query_embedding=[1.0, 0.0, 0.0, 0.0],
+    )
+    assert out == []
+
+
+def test_gate_by_similarity_drops_unparseable_score(monkeypatch):
+    """A KNN hit whose score cannot be parsed is dropped, never trusted."""
+    monkeypatch.setattr(Config, "T2_MIN_COSINE", 0.5)
+    store = TimelineSummaryStore(redis_client=MagicMock(), embedding_dim=4)
+    results = [
+        {"summary_id": "ok", "score": 0.1},
+        {"summary_id": "garbage", "score": "not-a-float"},
+        {"summary_id": "unscored"},  # no score at all: nothing to gate on, kept
+    ]
+
+    out = store._gate_by_similarity(results)
+    assert {d["summary_id"] for d in out} == {"ok", "unscored"}
+
+
+# ---------------------------------------------------------------- #34: topic-gated merge + metadata
+
+
+@pytest.mark.asyncio
+async def test_diary_merge_different_topic_appends(monkeypatch):
+    """Nearest same-day candidate has another topic -> append, never merge
+    new content under a stale label."""
+    monkeypatch.setattr(Config, "T2_MERGE_MIN_COSINE", 0.60)
+    monkeypatch.setattr(Config, "T2_MERGE_MAX_CHARS", 1500)
+    redis = DiaryRedis(_resp2_diary_hit(
+        summary_id="old-id", summary="Chuyện thể thao.", score=0.2,  # cosine 0.8
+        topic="sport",
+    ))
+    store = TimelineSummaryStore(
+        redis_client=redis, embedding_dim=8, embedding_service=FakeEmbedder(dim=8),
+    )
+
+    sid = await store.store_summary(
+        user_id="u1", summary="Chuyện công việc.", embedding=[0.1] * 8, topic="work",
+    )
+
+    assert sid != "old-id"
+    assert redis.hset_calls[0]["mapping"]["summary"] == "Chuyện công việc."
+    assert redis.hset_calls[0]["mapping"]["topic"] == "work"
+
+
+@pytest.mark.asyncio
+async def test_diary_merge_same_topic_case_insensitive(monkeypatch):
+    """Merge identity is normalized: 'Work' merges into stored 'work'."""
+    monkeypatch.setattr(Config, "T2_MERGE_MIN_COSINE", 0.60)
+    monkeypatch.setattr(Config, "T2_MERGE_MAX_CHARS", 1500)
+    redis = DiaryRedis(_resp2_diary_hit(
+        summary_id="old-id", summary="Sáng họp.", score=0.2, topic="work",
+    ))
+    store = TimelineSummaryStore(
+        redis_client=redis, embedding_dim=8, embedding_service=FakeEmbedder(dim=8),
+    )
+
+    sid = await store.store_summary(
+        user_id="u1", summary="Chiều code.", embedding=[0.1] * 8, topic="  Work ",
+    )
+
+    assert sid == "old-id"
+    # Stored topic label stays stable (normalized-equal); no churn.
+    assert "topic" not in redis.hset_calls[0]["mapping"]
+
+
+@pytest.mark.asyncio
+async def test_diary_merge_refreshes_topic_display(monkeypatch):
+    """The merged doc takes the new non-empty topic_display; empty keeps old."""
+    monkeypatch.setattr(Config, "T2_MERGE_MIN_COSINE", 0.60)
+    monkeypatch.setattr(Config, "T2_MERGE_MAX_CHARS", 1500)
+
+    redis = DiaryRedis(_resp2_diary_hit(
+        summary_id="old-id", summary="Sáng họp.", score=0.2,
+        topic="work", topic_display="Việc cũ",
+    ))
+    store = TimelineSummaryStore(
+        redis_client=redis, embedding_dim=8, embedding_service=FakeEmbedder(dim=8),
+    )
+    sid = await store.store_summary(
+        user_id="u1", summary="Chiều code.", embedding=[0.1] * 8,
+        topic="work", topic_display="Việc mới",
+    )
+    assert sid == "old-id"
+    assert redis.hset_calls[0]["mapping"]["topic_display"] == "Việc mới"
+
+    redis2 = DiaryRedis(_resp2_diary_hit(
+        summary_id="old-id", summary="Sáng họp.", score=0.2,
+        topic="work", topic_display="Việc cũ",
+    ))
+    store2 = TimelineSummaryStore(
+        redis_client=redis2, embedding_dim=8, embedding_service=FakeEmbedder(dim=8),
+    )
+    await store2.store_summary(
+        user_id="u1", summary="Chiều code.", embedding=[0.1] * 8, topic="work",
+    )
+    assert redis2.hset_calls[0]["mapping"]["topic_display"] == "Việc cũ"
+
+
+@pytest.mark.asyncio
+async def test_store_summary_appends_merge_version_zero():
+    redis = FakeRedis()
+    store = TimelineSummaryStore(redis_client=redis, embedding_dim=8)
+
+    await store.store_summary(user_id="u1", summary="A.", embedding=[0.1] * 8)
+
+    assert redis.hset_calls[0]["mapping"]["merge_version"] == 0
+
+
+# ---------------------------------------------------------------- #33: recent sorts content time
+
+
+@pytest.mark.asyncio
+async def test_get_recent_sorts_by_period_end_with_created_at_fallback():
+    """An old-created summary merged today (new period_end) sorts as recent;
+    legacy docs without period_end fall back to created_at."""
+    reply = [
+        3,
+        b"timeline:summary:legacy-new",
+        [b"summary", b"legacy recent", b"created_at", b"9000.0"],
+        b"timeline:summary:updated-old",
+        [b"summary", b"updated", b"created_at", b"1000.0",
+         b"period_end", b"9500.0"],
+        b"timeline:summary:legacy-old",
+        [b"summary", b"legacy old", b"created_at", b"2000.0"],
+    ]
+    redis = DiaryRedis(reply)
+    store = TimelineSummaryStore(redis_client=redis, embedding_dim=8)
+
+    results = await store.get_recent("u1", limit=10)
+
+    assert [d["summary_id"] for d in results] == [
+        "updated-old", "legacy-new", "legacy-old",
+    ]
+    # Each partition is windowed by its own content-time field, then merged.
+    assert len(redis.search_calls) == 2
+    sort_fields = [
+        list(call)[list(call).index("SORTBY") + 1]
+        for call in redis.search_calls
+    ]
+    assert sort_fields == ["period_end", "created_at"]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_falls_back_to_created_at_sort_on_legacy_index():
+    """Indexes predating the diary fields reject SORTBY period_end: retry
+    with created_at instead of returning nothing."""
+
+    class LegacyIndexRedis(FakeRedis):
+        def __init__(self, reply):
+            super().__init__()
+            self.reply = reply
+            self.sort_fields: list[str] = []
+
+        async def execute_command(self, *args):
+            if args[0] == "FT.SEARCH":
+                idx = list(args).index("SORTBY")
+                self.sort_fields.append(args[idx + 1])
+                if args[idx + 1] == "period_end":
+                    raise Exception("Property `period_end` not loaded nor in schema")
+                return self.reply
+            return await super().execute_command(*args)
+
+    reply = [1, b"timeline:summary:r1", [b"summary", b"x", b"created_at", b"5.0"]]
+    redis = LegacyIndexRedis(reply)
+    store = TimelineSummaryStore(redis_client=redis, embedding_dim=8)
+
+    results = await store.get_recent("u1", limit=10)
+
+    assert [d["summary_id"] for d in results] == ["r1"]
+    assert redis.sort_fields == ["period_end", "created_at"]
+
+
+# ---------------------------------------------------------------- dim mismatch fails closed
+
+
+@pytest.mark.asyncio
+async def test_dim_mismatch_fails_closed_and_preserves_data():
+    """A positively detected index DIM mismatch: writes AND reads raise;
+    the store never drops/deletes/flushes the live index or HASHes."""
+    redis = FakeRedis()
+    redis.ft_info_raises = False
+    redis.ft_info_reply = [
+        b"index_name", b"timeline_summaries",
+        b"attributes", [
+            [b"identifier", b"embedding", b"attribute", b"embedding",
+             b"type", b"VECTOR", b"dim", 999, b"distance_metric", b"COSINE"],
+        ],
+    ]
+    store = TimelineSummaryStore(redis_client=redis, embedding_dim=384)
+    await store.initialize()
+
+    seen_commands: list[str] = []
+    raw_execute = redis.execute_command
+
+    async def recording_execute(*args):
+        seen_commands.append(str(args[0]))
+        return await raw_execute(*args)
+
+    redis.execute_command = recording_execute
+    with pytest.raises(RuntimeError, match="reindex required"):
+        await store.store_summary(user_id="u", summary="x", embedding=[0.1] * 384)
+    with pytest.raises(RuntimeError, match="reindex required"):
+        await store.search("u", [0.1] * 384, limit=5)
+    with pytest.raises(RuntimeError, match="reindex required"):
+        await store.get_recent("u", limit=5)
+    assert redis.hset_calls == []
+    assert not {"FT.DROPINDEX", "DEL", "UNLINK", "FLUSHALL", "FLUSHDB"} & set(seen_commands)
+
+    # Recovery without restart: matching dims re-arms the store.
+    redis.ft_info_reply = [
+        b"index_name", b"timeline_summaries",
+        b"attributes", [
+            [b"identifier", b"embedding", b"attribute", b"embedding",
+             b"type", b"VECTOR", b"dim", 384, b"distance_metric", b"COSINE"],
+        ],
+    ]
+    await store.initialize()
+    await store.store_summary(user_id="u", summary="x", embedding=[0.1] * 384)
+    assert len(redis.hset_calls) == 1

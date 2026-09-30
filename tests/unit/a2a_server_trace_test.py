@@ -3,7 +3,7 @@ from contextlib import contextmanager
 import pytest
 
 from twin.shared.a2a.server import A2AServer
-from twin.shared.a2a.types import A2AMessage, A2ATask, AgentCard, Part, TaskStatus
+from twin.shared.a2a.types import A2AMessage, AgentCard, Part, TaskStatus
 
 
 @pytest.mark.asyncio
@@ -27,11 +27,14 @@ async def test_execute_handler_runs_inside_langsmith_parent_context(monkeypatch)
         agent_card=AgentCard(name="test", description="", url="", version="1"),
         skill_handlers={"chat": handler},
     )
-    task = A2ATask(id="t1", session_id="s1", skill="chat", status=TaskStatus.IN_PROGRESS)
+    task = server._store.create(
+        task_id="t1", session_id="s1", skill="chat", creator_peer="march7"
+    )
+    assert task is not None
     parent = {"langsmith-trace": "trace-id", "baggage": "langsmith-project=march7-bot"}
 
-    await server._execute_handler("t1", task, handler, {"text": "done"}, parent)
+    await server._execute_handler("t1", handler, {"text": "done"}, parent)
 
     assert seen_parent == [parent]
     assert task.status == TaskStatus.COMPLETED
-    assert server._task_buffers["t1"][0].parts[0].text == "done"
+    assert server._store.snapshot("t1")[0].parts[0].text == "done"

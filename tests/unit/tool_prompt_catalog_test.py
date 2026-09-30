@@ -160,6 +160,7 @@ def test_native_schema_description_comes_from_tool_description_tag():
         "web_search": "guides/web_search.md",
         "run_python_code": "guides/run_python_code.md",
         "host_system": "guides/host_system.md",
+        "request_consolidation": "guides/request_consolidation.md",
     }
     descriptions = {
         schema["function"]["name"]: schema["function"]["description"]
@@ -255,6 +256,7 @@ def test_catalog_output_is_unchanged_by_backend_metadata():
         [
             f"- get_profile: {read_tool_description('get_profile', 'guides/get_profile.md')}",
             f"- host_system: {read_tool_description('host_system', 'guides/host_system.md')}",
+            f"- request_consolidation: {read_tool_description('request_consolidation', 'guides/request_consolidation.md')}",
             f"- run_python_code: {read_tool_description('run_python_code', 'guides/run_python_code.md')}",
             f"- search_memory: {read_tool_description('search_memory', 'guides/search_memory.md')}",
             f"- update_personality: {read_tool_description('update_personality', 'guides/update_personality.md')}",

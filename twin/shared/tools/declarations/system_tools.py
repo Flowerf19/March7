@@ -90,4 +90,18 @@ SYSTEM_TOOL_SPECS: tuple[ToolSpec, ...] = (
         allowed_to=frozenset({"evernight"}),
         guide_path="guides/gateway_admin.md",
     ),
+    ToolSpec(
+        module="twin.shared.tools.modules.a2a.march7_snapshot_tool",
+        class_name="March7SnapshotTool",
+        visible_to=frozenset({"evernight"}),
+        allowed_to=frozenset({"evernight"}),
+        guide_path="guides/march7_snapshot.md",
+    ),
+    ToolSpec(
+        module="twin.shared.tools.modules.a2a.request_consolidation_tool",
+        class_name="RequestConsolidationTool",
+        visible_to=frozenset({"march7"}),
+        allowed_to=frozenset({"march7"}),
+        guide_path="guides/request_consolidation.md",
+    ),
 )

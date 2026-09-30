@@ -8,7 +8,7 @@ from twin.shared.a2a.types import A2AMessage, A2ATask, Part, TaskStatus
 
 class FakeA2AClient(A2AClient):
     def __init__(self, messages: list[A2AMessage], status: TaskStatus = TaskStatus.COMPLETED):
-        super().__init__("http://a2a.test")
+        super().__init__("http://a2a.test", actor="march7", secret="test-secret")
         self.messages = messages
         self.status = status
         self.sent_params = []

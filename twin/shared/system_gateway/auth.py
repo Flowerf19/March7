@@ -1,22 +1,23 @@
 """Authentication helpers for System Gateway.
 
-The shared secret is supplied via configuration (env var or secret file) on
-both client and server. Each request carries a timestamp and nonce, and the
-server validates that the HMAC signature matches.
+The shared request secret is supplied via configuration (env var or secret
+file) on both client and server. Each request carries a timestamp and nonce,
+and the server validates that the HMAC signature matches.
 
 Replay protection: the server keeps an in-memory set of recently seen nonces
 and rejects any request whose timestamp is too old or whose nonce has already
 been seen.
 
 Approval tokens (mint_approval_token / verify_approval_token) bind an approval
-to a specific action, actor, and short TTL, and are single-use. NOTE on the
-trust model: today both the request signature and the approval token derive
-their HMAC key from the same shared secret (derive_key), so a party able to
-sign a request can also mint a valid approval token — this does NOT
-cryptographically separate the request signer from the approval issuer. The
-intended hardening is a separate approval key held only by the owner-approval
-path (Evernight); mint/verify already accept an independent ``secret=`` and a
-versioned payload, so that swap is a wiring change, not a format change.
+to a specific canonical action, actor, and short TTL, and are single-use.
+Trust model (plan A): the approval HMAC key is DIFFERENT from the request
+signing key. Only the owner-trusted approval issuer (Evernight, plus the
+owner CLI on the host) holds the approval key; March7 holds only the request
+key and consumes grants, never mints. The gateway verifies approvals with the
+approval key and requests with the shared request key; a missing approval key
+fails closed. The ``action`` passed to mint/verify MUST be the output of
+``canonical_approval_action`` so command/shell/cwd/timeout (or update
+versions) are bound, not just the action name.
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ import json as jsonlib
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 
 SIGNATURE_HEADER = "X-System-Gateway-Signature"
@@ -278,6 +279,100 @@ class ApprovalTokenResult:
     nonce: str | None = None
 
 
+SHELL_TIMEOUT_DEFAULT = 30
+SHELL_TIMEOUT_MIN = 1
+SHELL_TIMEOUT_MAX = 300
+
+SELF_UPDATE_ACTION = "self.update"
+SELF_UPDATE_ALIASES = frozenset({"self.update", "self_update"})
+
+
+def _normalize_shell_timeout(value: Any) -> int:
+    """Normalize an effective shell timeout (server execution semantics)."""
+
+    try:
+        if value is None:
+            return SHELL_TIMEOUT_DEFAULT
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return SHELL_TIMEOUT_DEFAULT
+    return max(SHELL_TIMEOUT_MIN, min(seconds, SHELL_TIMEOUT_MAX))
+
+
+def _normalize_optional_str(value: Any) -> str | None:
+    """Normalize shell/cwd: missing or empty string becomes None, else exact."""
+
+    if value is None:
+        return None
+    text = str(value)
+    if text == "":
+        return None
+    return text
+
+
+def canonical_approval_action(action: str, payload: Mapping[str, Any]) -> str:
+    """Build the canonical action string bound by an approval token.
+
+    Both the owner-trusted issuer (Evernight / owner CLI) and the gateway
+    verifier MUST call this exact function with the effective execution
+    fields. The returned string is passed as ``action=`` to
+    ``mint_approval_token`` / ``verify_approval_token``.
+
+    Protocol-normalization decisions (issuer and verifier must match):
+
+    - ``action`` is stripped; ``"shell"`` and ``"self.update"``
+      (alias ``"self_update"`` accepted, normalized to ``"self.update"``)
+      are supported. Anything else raises ``ValueError``; removed legacy
+      structured actions are never revived here.
+    - ``approval_id`` and unknown keys are always excluded; only effective
+      execution fields are bound.
+    - shell: ``command`` is stripped and required (empty raises
+      ``ValueError``); ``shell``/``cwd`` use ``_normalize_optional_str``
+      (missing/``""`` -> ``None``, otherwise exact, no stripping);
+      ``timeout`` uses server execution semantics (default 30, clamp
+      1..300, invalid -> 30). ``max_output_chars`` is output-shaping only
+      and intentionally NOT bound.
+    - self.update: ``from_version`` is stripped (may be empty; the server
+      still enforces version match after token verification);
+      ``to_version`` missing/empty/whitespace -> ``None``, else stripped.
+    - Encoding is JSON with ``sort_keys=True`` and compact separators, so
+      field order and whitespace cannot cause a mismatch.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("approval payload must be a mapping")
+    norm_action = str(action or "").strip()
+    if norm_action == "shell":
+        command = str(payload.get("command") or "").strip()
+        if not command:
+            raise ValueError("shell approval requires a non-empty command")
+        canonical = {
+            "action": "shell",
+            "command": command,
+            "cwd": _normalize_optional_str(payload.get("cwd")),
+            "shell": _normalize_optional_str(payload.get("shell")),
+            "timeout": _normalize_shell_timeout(payload.get("timeout")),
+        }
+        return jsonlib.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    if norm_action in SELF_UPDATE_ALIASES:
+        from_version = str(payload.get("from_version") or "").strip()
+        raw_target = payload.get("to_version")
+        if raw_target is None:
+            to_version = None
+        else:
+            stripped = str(raw_target).strip()
+            to_version = stripped or None
+        canonical_update = {
+            "action": SELF_UPDATE_ACTION,
+            "from_version": from_version,
+            "to_version": to_version,
+        }
+        return jsonlib.dumps(
+            canonical_update, sort_keys=True, separators=(",", ":")
+        )
+    raise ValueError(f"unsupported approval action: {action!r}")
+
+
 def mint_approval_token(
     *,
     secret: str | None,
@@ -290,8 +385,11 @@ def mint_approval_token(
     """Mint a compact, action-bound, single-use approval token.
 
     The token binds issued_at, expiry, a fresh nonce, the actor, and
-    sha256(action) under an HMAC-SHA256 signature derived from the shared
-    secret. Format: ``<urlsafe-b64(payload-json)>.<hex-signature>``.
+    sha256(action) under an HMAC-SHA256 signature derived from the approval
+    secret (which MUST differ from the request-signing shared secret).
+    ``action`` MUST be ``canonical_approval_action(...)`` output for
+    shell/self.update so execution fields are bound. Format:
+    ``<urlsafe-b64(payload-json)>.<hex-signature>``.
     """
 
     issued_at = int(now if now is not None else time.time())
@@ -373,7 +471,7 @@ def verify_approval_token(
         return ApprovalTokenResult(False, "approval_signature_mismatch", nonce=token_nonce)
 
     current = now if now is not None else time.time()
-    if current > expiry:
+    if current >= expiry:
         return ApprovalTokenResult(False, "approval_expired", nonce=token_nonce)
     if not hmac.compare_digest(token_action_digest, _action_digest(action)):
         return ApprovalTokenResult(False, "approval_action_mismatch", nonce=token_nonce)

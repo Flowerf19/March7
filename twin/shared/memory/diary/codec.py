@@ -17,13 +17,28 @@ def pack_embedding(embedding: list[float]) -> bytes:
 
 
 def unpack_embedding(value: Any) -> list[float]:
-    """Unpack FLOAT32 bytes to a Python list of floats."""
+    """Unpack FLOAT32 bytes to a Python list of floats.
+
+    Never text-decodes: FLOAT32 bytes that happen to be UTF-8-valid (e.g.
+    ``struct.pack('8f', *([0.5] * 8))``) must round-trip to floats, not
+    collapse to ``[]`` via a str detour (#25). Anything that is not a raw
+    ``4N``-byte buffer (or an honest float list) decodes to ``[]`` — the
+    cosine gates treat ``[]`` as unverifiable and fail closed.
+    """
     if isinstance(value, list):
-        return [float(x) for x in value]
+        try:
+            return [float(x) for x in value]
+        except (TypeError, ValueError):
+            return []
     if not isinstance(value, (bytes, bytearray)):
         return []
+    if len(value) == 0 or len(value) % 4 != 0:
+        return []
     count = len(value) // 4
-    return list(struct.unpack(f"{count}f", value[: count * 4]))
+    try:
+        return list(struct.unpack(f"{count}f", value[: count * 4]))
+    except struct.error:
+        return []
 
 
 def decode_fields(mapping: Any) -> dict[str, Any]:
@@ -40,19 +55,24 @@ def decode_fields(mapping: Any) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for k, v in pairs:
         field_name = k.decode() if isinstance(k, bytes) else k
+        if field_name == "embedding":
+            # Unpack from the RAW bytes before any text decoding (#25): a
+            # blanket v.decode() first turns UTF-8-valid FLOAT32 buffers
+            # into str, and unpack then yields [] — silently disarming the
+            # cosine gate for BM25-only docs.
+            result[field_name] = unpack_embedding(v)
+            continue
         try:
             field_value: Any = v.decode() if isinstance(v, bytes) else v
         except (UnicodeDecodeError, AttributeError):
             field_value = v
 
-        if field_name == "embedding":
-            field_value = unpack_embedding(field_value)
-        elif field_name == "score":
+        if field_name == "score":
             try:
                 field_value = float(field_value)
             except (TypeError, ValueError):
                 pass
-        elif field_name in {"importance", "version"}:
+        elif field_name in {"importance", "version", "merge_version"}:
             try:
                 field_value = int(field_value)
             except (TypeError, ValueError):

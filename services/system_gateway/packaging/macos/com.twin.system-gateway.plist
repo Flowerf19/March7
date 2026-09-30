@@ -17,6 +17,8 @@
         <string>8380</string>
         <key>SYSTEM_GATEWAY_SHARED_SECRET_FILE</key>
         <string>/Users/me/Library/Application Support/system-gateway/secret</string>
+        <key>SYSTEM_GATEWAY_APPROVAL_SECRET_FILE</key>
+        <string>/Users/me/Library/Application Support/system-gateway/approval_secret</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
