@@ -9,7 +9,11 @@ services:
       - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-stack-server --appendonly yes --appendfsync everysec --save 900 1 --save 300 10 --save 60 10000
+    # NOTE: --dir /data is required. redis-stack defaults `dir` to
+    # /var/lib/redis-stack (ephemeral overlay), so without this flag no
+    # persistence ever reaches the redis_data volume and every redis
+    # recreate wipes T1/T2. Proven by restart-survival test 2026-09-30.
+    command: redis-stack-server --dir /data --appendonly yes --appendfsync everysec --save 900 1 --save 300 10 --save 60 10000
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
