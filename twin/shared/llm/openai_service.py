@@ -103,7 +103,14 @@ class OpenAIService(BaseLLMService):
             (i for i, m in enumerate(messages) if m.get("role") == "user"), None
         )
         convo = messages[first_user:] if first_user is not None else messages
-        api_messages = [{"role": "system", "content": final_system_prompt}] + convo
+        # Strict providers (e.g. commandcode) reject an empty system message
+        # with 400 "system message must have content". Utility calls like
+        # consolidation pass include_persona=False with no system_prompt, so
+        # omit the system role entirely instead of sending content="".
+        if final_system_prompt and final_system_prompt.strip():
+            api_messages = [{"role": "system", "content": final_system_prompt}] + convo
+        else:
+            api_messages = list(convo)
 
         payload = {
             "model": self.model,
